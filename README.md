@@ -63,6 +63,20 @@ Reading root, and reading other accounts, needs to be allowed: run as root, or h
 | `permissions` | `.ssh` or `authorized_keys` is group- or world-accessible |
 | `weak-algorithm` | DSA, or RSA under 3072 bits |
 | `outside-push` | a non-root key is not in `--allow` |
+| `cert-authority` | a line is marked `cert-authority` |
+| `ssh-certificate` | a certificate is expired, not yet valid, a host certificate, or unreadable |
+| `accepted-algorithms` | `PubkeyAcceptedAlgorithms` still allows `ssh-rsa`, `ssh-dss`, or SHA-1 |
+| `ca-algorithms` | `CASignatureAlgorithms` still allows those |
+| `trusted-user-ca` | `TrustedUserCAKeys` is set, so a signed key can bypass the push |
+| `revoked-keys` | a user CA is trusted and `RevokedKeys` is none |
+| `authorized-keys-command` | a command can inject keys that are not in the file |
+| `authorized-keys-file` | `sshd` also reads a path other than `.ssh/authorized_keys` |
+| `hostbased-auth` | host-based authentication is on |
+| `auth-methods` | `AuthenticationMethods` still allows a password |
+
+Fields that are absent from the observation are skipped, not treated as a pass. Paste full `sshd -T` output when you want the CA and algorithm checks.
+
+Key text is fingerprinted in memory and then dropped. A private key, including a PuTTY private key, stops the run and is not written. The report never contains a key body. `--allow` is not deleted; it is your file.
 
 `forced-commands-only` is a warning. Pass `--no-weak` or `--no-outside` to skip those two comparisons.
 

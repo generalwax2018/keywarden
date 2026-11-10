@@ -188,7 +188,10 @@ def inspect_account(user: str, home: Path) -> Account:
         text = key_file.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return Account(user, file_mode(ssh_dir), file_mode(key_file), [], "unreadable")
-    keys, _issues = parse_public_keys(text, user)
+    try:
+        keys, _issues = parse_public_keys(text, user)
+    finally:
+        del text
     return Account(user, file_mode(ssh_dir), file_mode(key_file), keys, "ok")
 
 

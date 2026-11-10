@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from keywarden.parse import KeyRef
@@ -16,6 +17,14 @@ class SshdFacts:
     kbd_interactive_authentication: str = "unknown"
     pubkey_authentication: str = "unknown"
     permit_empty_passwords: str = "unknown"
+    authentication_methods: str = "unknown"
+    hostbased_authentication: str = "unknown"
+    pubkey_accepted_algorithms: str = "unknown"
+    ca_signature_algorithms: str = "unknown"
+    trusted_user_ca_keys: str = "unknown"
+    revoked_keys: str = "unknown"
+    authorized_keys_command: str = "unknown"
+    authorized_keys_file: str = "unknown"
 
     def as_dict(self) -> dict:
         return {
@@ -24,6 +33,14 @@ class SshdFacts:
             "kbdInteractiveAuthentication": self.kbd_interactive_authentication,
             "pubkeyAuthentication": self.pubkey_authentication,
             "permitEmptyPasswords": self.permit_empty_passwords,
+            "authenticationMethods": self.authentication_methods,
+            "hostbasedAuthentication": self.hostbased_authentication,
+            "pubkeyAcceptedAlgorithms": self.pubkey_accepted_algorithms,
+            "caSignatureAlgorithms": self.ca_signature_algorithms,
+            "trustedUserCaKeys": self.trusted_user_ca_keys,
+            "revokedKeys": self.revoked_keys,
+            "authorizedKeysCommand": self.authorized_keys_command,
+            "authorizedKeysFile": self.authorized_keys_file,
         }
 
 
@@ -92,6 +109,16 @@ def parse_sshd(text: str) -> SshdFacts:
         kbd_interactive_authentication=pick("kbdinteractiveauthentication"),
         pubkey_authentication=pick("pubkeyauthentication"),
         permit_empty_passwords=pick("permitemptypasswords"),
+        authentication_methods=pick("authenticationmethods"),
+        hostbased_authentication=pick("hostbasedauthentication"),
+        pubkey_accepted_algorithms=pick("pubkeyacceptedalgorithms")
+        if pick("pubkeyacceptedalgorithms") != "unknown"
+        else pick("pubkeyacceptedkeytypes"),
+        ca_signature_algorithms=pick("casignaturealgorithms"),
+        trusted_user_ca_keys=pick("trustedusercakeys"),
+        revoked_keys=pick("revokedkeys"),
+        authorized_keys_command=pick("authorizedkeyscommand"),
+        authorized_keys_file=pick("authorizedkeysfile"),
     )
 
 
@@ -115,7 +142,7 @@ def _describe(keys: list[KeyRef]) -> str:
 
 
 def _with_user(key: KeyRef, user: str) -> KeyRef:
-    return KeyRef(key.fingerprint, key.type, key.kind, key.bits, key.comment, user)
+    return KeyRef(key.fingerprint, key.type, key.kind, key.bits, key.comment, user, key.cert_authority, key.cert)
 
 
 def evaluate(host: HostObservation, push: list[KeyRef], policy: Policy) -> list[Finding]:
@@ -342,6 +369,126 @@ def evaluate(host: HostObservation, push: list[KeyRef], policy: Policy) -> list[
         else:
             title = "A key is not in the push" if len(outside) == 1 else f"{len(outside)} keys are not in the push"
             findings.append(Finding("outside-push", "fail", title, _describe(outside)))
+
+    all_keys = [_with_user(key, account.user) for account in host.accounts for key in account.keys]
+    authorities = [key for key in all_keys if key.cert_authority]
+    if not authorities:
+        findings.append(
+            Finding(
+                "cert-authority",
+                "pass",
+                "No key is a certificate authority",
+                "Nothing in authorized_keys is marked cert-authority, so one line cannot sign in extra keys.",
+            )
+        )
+    else:
+        title = "A line trusts a certificate authority" if len(authorities) == 1 else f"{len(authorities)} lines trust a certificate authority"
+        findings.append(
+            Finding(
+                "cert-authority",
+                "fail",
+                title,
+                _describe(authorities) + ". A cert-authority line lets any certificate that CA signs log in, including keys you did not push.",
+            )
+        )
+
+    now = int(time.time())
+    problems = []
+    for key in all_keys:
+        cert = key.cert
+        if not cert:
+            continue
+        who = f"{key.user + ' · ' if key.user else ''}{key.fingerprint}"
+        if cert.unreadable:
+            problems.append(f"{who} could not be read")
+        elif cert.cert_type == "host":
+            problems.append(f"{who} is a host certificate")
+        elif cert.valid_after > now:
+            problems.append(f"{who} is not valid yet")
+        elif cert.valid_before is not None and cert.valid_before < now:
+            problems.append(f"{who} has expired")
+    if problems:
+        title = "An SSH certificate is not acceptable" if len(problems) == 1 else f"{len(problems)} SSH certificates are not acceptable"
+        findings.append(Finding("ssh-certificate", "fail", title, "; ".join(problems)))
+    elif any(key.cert for key in all_keys):
+        findings.append(
+            Finding(
+                "ssh-certificate",
+                "pass",
+                "SSH certificates are inside their validity window",
+                "Each certificate is a user certificate, currently valid. The certificate body was not kept.",
+            )
+        )
+    else:
+        findings.append(
+            Finding(
+                "ssh-certificate",
+                "pass",
+                "No SSH certificates are authorized",
+                "authorized_keys has no certificate. A trusted user CA is checked separately when sshd -T includes it.",
+            )
+        )
+
+    def seen(value: str) -> bool:
+        return bool(value) and value.lower() != "unknown"
+
+    def weak_tokens(value: str) -> list[str]:
+        return [token for token in value.lower().replace(",", " ").split() if token in {"ssh-rsa", "ssh-dss"} or "sha1" in token]
+
+    if seen(host.sshd.pubkey_accepted_algorithms):
+        weak = weak_tokens(host.sshd.pubkey_accepted_algorithms)
+        if not weak:
+            findings.append(Finding("accepted-algorithms", "pass", "sshd rejects weak public-key algorithms", "PubkeyAcceptedAlgorithms does not include ssh-rsa, ssh-dss, or SHA-1."))
+        else:
+            findings.append(Finding("accepted-algorithms", "fail", "sshd still accepts a weak public-key algorithm", f"PubkeyAcceptedAlgorithms includes {', '.join(weak)}."))
+
+    if seen(host.sshd.ca_signature_algorithms):
+        weak = weak_tokens(host.sshd.ca_signature_algorithms)
+        if not weak:
+            findings.append(Finding("ca-algorithms", "pass", "CA signatures do not use SHA-1", "CASignatureAlgorithms does not include ssh-rsa, ssh-dss, or SHA-1."))
+        else:
+            findings.append(Finding("ca-algorithms", "fail", "A CA may still sign with a weak algorithm", f"CASignatureAlgorithms includes {', '.join(weak)}."))
+
+    if seen(host.sshd.trusted_user_ca_keys):
+        trusted = host.sshd.trusted_user_ca_keys.strip().lower() not in {"", "none"}
+        if trusted:
+            findings.append(Finding("trusted-user-ca", "fail", "A user CA can authorize keys that were not pushed", f"TrustedUserCAKeys is {host.sshd.trusted_user_ca_keys}."))
+        else:
+            findings.append(Finding("trusted-user-ca", "pass", "No user CA is trusted", "TrustedUserCAKeys is none."))
+        if trusted and seen(host.sshd.revoked_keys):
+            if host.sshd.revoked_keys.strip().lower() in {"", "none"}:
+                findings.append(Finding("revoked-keys", "warn", "The trusted CA has no revocation list", "RevokedKeys is none."))
+            else:
+                findings.append(Finding("revoked-keys", "pass", "A revocation list is configured", f"RevokedKeys is {host.sshd.revoked_keys}."))
+
+    if seen(host.sshd.authorized_keys_command):
+        if host.sshd.authorized_keys_command.strip().lower() in {"", "none"}:
+            findings.append(Finding("authorized-keys-command", "pass", "No command injects authorized keys", "AuthorizedKeysCommand is none."))
+        else:
+            findings.append(Finding("authorized-keys-command", "fail", "A command can add keys that are not on disk", f"AuthorizedKeysCommand is {host.sshd.authorized_keys_command}."))
+
+    if seen(host.sshd.authorized_keys_file):
+        standard = {".ssh/authorized_keys", ".ssh/authorized_keys2"}
+        files = [part for part in host.sshd.authorized_keys_file.replace(",", " ").split() if part]
+        extra = [part for part in files if part not in standard]
+        if not extra:
+            findings.append(Finding("authorized-keys-file", "pass", "Authorized keys are read from the standard files", " ".join(files) or ".ssh/authorized_keys"))
+        else:
+            findings.append(Finding("authorized-keys-file", "warn", "sshd also reads authorized keys from another path", f"AuthorizedKeysFile includes {', '.join(extra)}."))
+
+    if seen(host.sshd.hostbased_authentication):
+        if host.sshd.hostbased_authentication.lower() == "no":
+            findings.append(Finding("hostbased-auth", "pass", "Host-based authentication is off", "HostbasedAuthentication is no."))
+        else:
+            findings.append(Finding("hostbased-auth", "fail", "Host-based authentication is on", "HostbasedAuthentication is yes."))
+
+    if seen(host.sshd.authentication_methods):
+        methods = host.sshd.authentication_methods.lower().replace(",", " ")
+        tokens = methods.split()
+        if methods.strip() == "any" or "password" in tokens or "keyboard-interactive" in tokens:
+            findings.append(Finding("auth-methods", "fail", "Authentication methods still allow a password", f"AuthenticationMethods is {host.sshd.authentication_methods}."))
+        else:
+            findings.append(Finding("auth-methods", "pass", "Authentication methods do not include a password", f"AuthenticationMethods is {host.sshd.authentication_methods}."))
 
     return findings
 

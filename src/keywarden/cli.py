@@ -21,7 +21,10 @@ def _load_allow(path: Path | None):
     if path.stat().st_size > MAX_INPUT_BYTES:
         raise ValueError("--allow file is larger than 1 MB")
     text = path.read_text(encoding="utf-8", errors="replace")
-    keys, issues = parse_public_keys(text)
+    try:
+        keys, issues = parse_public_keys(text)
+    finally:
+        del text
     if issues:
         print(f"{len(issues)} line(s) in --allow were not public keys and were ignored", file=sys.stderr)
     return keys
@@ -81,10 +84,13 @@ def _check(args: argparse.Namespace) -> int:
         host = collect_remote(args.host, args.account)
     else:
         raw = read_observation(args.observation)
-        if len(raw.encode("utf-8", errors="replace")) > MAX_INPUT_BYTES:
-            raise ValueError("observation is larger than 1 MB")
-        address = "stdin" if args.observation == "-" else "file"
-        host = parse_protocol(raw, address=address)
+        try:
+            if len(raw.encode("utf-8", errors="replace")) > MAX_INPUT_BYTES:
+                raise ValueError("observation is larger than 1 MB")
+            address = "stdin" if args.observation == "-" else "file"
+            host = parse_protocol(raw, address=address)
+        finally:
+            del raw
     policy = Policy(flag_outside_push=not args.no_outside, flag_weak=not args.no_weak)
     findings = apply_drift(evaluate(host, push, policy), _load_prior(args.prior, host.name))
     document = _report(host, push, findings)

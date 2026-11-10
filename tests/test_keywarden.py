@@ -202,5 +202,79 @@ class CliTests(unittest.TestCase):
             self.assertFalse(leaked.exists())
 
 
+class CertificateTests(unittest.TestCase):
+    def _signed(self, folder: Path, validity: str, host: bool = False, name: str = "user") -> tuple[str, str]:
+        ca = folder / f"{name}-ca"
+        user = folder / name
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-f", str(ca), "-N", ""], check=True)
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-f", str(user), "-N", ""], check=True)
+        command = ["ssh-keygen", "-q", "-s", str(ca), "-I", name, "-n", "ops", "-V", validity]
+        if host:
+            command.append("-h")
+        command.append(str(user) + ".pub")
+        subprocess.run(command, check=True)
+        cert = (folder / f"{name}-cert.pub").read_text(encoding="utf-8").strip()
+        ca_pub = ca.with_suffix(".pub").read_text(encoding="utf-8").strip()
+        for private in (ca, user):
+            private.unlink(missing_ok=True)
+        return cert, ca_pub
+
+    def test_certificate_matches_ca_and_is_not_stored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cert, ca_pub = self._signed(Path(tmp), "+1d")
+            keys, issues = parse_public_keys(cert, user="ops")
+            ca_keys, _ = parse_public_keys(ca_pub)
+            self.assertEqual(issues, [])
+            self.assertIsNotNone(keys[0].cert)
+            self.assertEqual(keys[0].cert.cert_type, "user")
+            self.assertEqual(keys[0].cert.ca_fingerprint, ca_keys[0].fingerprint)
+            self.assertFalse(keys[0].cert_authority)
+            blob = cert.split()[1]
+            self.assertNotIn(blob, json.dumps(keys[0].public()))
+            host = parse_protocol(TIGHT.format(ops=cert))
+            findings = evaluate(host, keys, Policy())
+            self.assertEqual(_codes(findings)["ssh-certificate"], "pass")
+
+    def test_expired_host_and_authority_fail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            expired, _ca = self._signed(folder, "-5d:-1d", name="expired")
+            host = parse_protocol(TIGHT.format(ops=expired))
+            self.assertEqual(_codes(evaluate(host, [], Policy()))["ssh-certificate"], "fail")
+            host_cert, _ca = self._signed(folder, "+1d", host=True, name="hostcert")
+            observed = parse_protocol(TIGHT.format(ops=host_cert))
+            self.assertEqual(_codes(evaluate(observed, [], Policy()))["ssh-certificate"], "fail")
+            plain, _ = parse_public_keys(OPS)
+            marked = "cert-authority " + OPS
+            flagged, _ = parse_public_keys(marked)
+            self.assertTrue(flagged[0].cert_authority)
+            account_host = parse_protocol(TIGHT.format(ops=marked))
+            self.assertEqual(_codes(evaluate(account_host, plain, Policy()))["cert-authority"], "fail")
+
+    def test_daemon_trust_is_not_a_pass_when_present(self):
+        text = TIGHT.format(ops=OPS).replace(
+            "permitemptypasswords no",
+            "\n".join(
+                [
+                    "permitemptypasswords no",
+                    "trustedusercakeys /etc/ssh/ca.pub",
+                    "revokedkeys none",
+                    "pubkeyacceptedalgorithms ssh-ed25519,rsa-sha2-256,ssh-rsa",
+                    "authorizedkeyscommand /usr/local/bin/keys",
+                    "hostbasedauthentication yes",
+                    "authenticationmethods publickey,password",
+                ]
+            ),
+        )
+        findings = evaluate(parse_protocol(text), parse_public_keys(OPS)[0], Policy())
+        codes = _codes(findings)
+        self.assertEqual(codes["trusted-user-ca"], "fail")
+        self.assertEqual(codes["revoked-keys"], "warn")
+        self.assertEqual(codes["accepted-algorithms"], "fail")
+        self.assertEqual(codes["authorized-keys-command"], "fail")
+        self.assertEqual(codes["hostbased-auth"], "fail")
+        self.assertEqual(codes["auth-methods"], "fail")
+
+
 if __name__ == "__main__":
     unittest.main()
