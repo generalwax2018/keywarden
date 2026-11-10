@@ -6,7 +6,8 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # ubuntu-latest is 26.04 and no longer has Python 3.9. 24.04 still does.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
