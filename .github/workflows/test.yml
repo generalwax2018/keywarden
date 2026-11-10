@@ -90,3 +90,11 @@ jobs:
           assert findings["permit-root"] == "fail", findings
           assert findings["password-auth"] == "fail", findings
           EOF
+      - name: where finds the runner key, and the access table is written
+        run: |
+          PYTHONPATH=src python3 -m keywarden where --key ~/.ssh/id_ed25519.pub --host "$USER@localhost" --account mallory
+          set +e
+          PYTHONPATH=src python3 -m keywarden check --host "$USER@localhost" --account mallory --csv review.csv --keys
+          set -e
+          grep -q "$(ssh-keygen -lf ~/.ssh/id_ed25519.pub | awk '{print $2}')" review.csv
+          ! grep -q "$(awk '{print $2}' ~/.ssh/id_ed25519.pub)" review.csv

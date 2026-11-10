@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import re
 import time
 from dataclasses import dataclass, field
@@ -28,6 +29,11 @@ class SshdFacts:
     revoked_keys: str = "unknown"
     authorized_keys_command: str = "unknown"
     authorized_keys_file: str = "unknown"
+    log_level: str = "unknown"
+    allow_tcp_forwarding: str = "unknown"
+    allow_agent_forwarding: str = "unknown"
+    x11_forwarding: str = "unknown"
+    permit_user_environment: str = "unknown"
 
     def as_dict(self) -> dict:
         return {
@@ -44,6 +50,11 @@ class SshdFacts:
             "revokedKeys": self.revoked_keys,
             "authorizedKeysCommand": self.authorized_keys_command,
             "authorizedKeysFile": self.authorized_keys_file,
+            "logLevel": self.log_level,
+            "allowTcpForwarding": self.allow_tcp_forwarding,
+            "allowAgentForwarding": self.allow_agent_forwarding,
+            "x11Forwarding": self.x11_forwarding,
+            "permitUserEnvironment": self.permit_user_environment,
         }
 
 
@@ -56,6 +67,18 @@ class Account:
     read_state: str  # ok, absent, unreadable
     uid: int | None = None
     password_locked: bool | None = None
+    groups: list[str] | None = None
+    sudo_state: str = "unknown"  # ok, unreadable, absent (no sudo installed), unknown
+    sudo_lines: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Login:
+    """Successful public-key logins for one account and fingerprint, from sshd's own log."""
+
+    last: int | None
+    count: int
+    source: str = ""
 
 
 @dataclass
@@ -71,6 +94,10 @@ class HostObservation:
     match_blocks: str = "unknown"  # yes, no, unknown
     sshd_root: SshdFacts | None = None  # sshd -T -C user=root, when Match blocks exist
     privilege: str = "unknown"  # root, sudo, none
+    now: int | None = None  # the host's clock when it was observed
+    log_source: str = "unknown"  # journal, file, none, unreadable, unknown
+    log_since: int | None = None  # earliest log line the collector saw
+    logins: dict[tuple[str, str], Login] = field(default_factory=dict)
 
 
 @dataclass
@@ -81,6 +108,8 @@ class Finding:
     detail: str
     drift: str | None = None
     new_fingerprints: list[str] = field(default_factory=list)
+    waivers: list[dict] = field(default_factory=list)
+    was: str | None = None  # the severity before a waiver accepted it
 
     @property
     def fingerprints(self) -> list[str]:
@@ -100,6 +129,10 @@ class Finding:
             data["drift"] = self.drift
         if self.new_fingerprints:
             data["newFingerprints"] = list(self.new_fingerprints)
+        if self.waivers:
+            data["waivers"] = list(self.waivers)
+        if self.was:
+            data["was"] = self.was
         return data
 
 
@@ -107,6 +140,7 @@ class Finding:
 class Policy:
     flag_outside_push: bool = True
     flag_weak: bool = True
+    stale_days: int = 90
 
 
 def parse_sshd(text: str) -> SshdFacts:
@@ -139,6 +173,11 @@ def parse_sshd(text: str) -> SshdFacts:
         revoked_keys=pick("revokedkeys"),
         authorized_keys_command=pick("authorizedkeyscommand"),
         authorized_keys_file=pick("authorizedkeysfile"),
+        log_level=pick("loglevel"),
+        allow_tcp_forwarding=pick("allowtcpforwarding"),
+        allow_agent_forwarding=pick("allowagentforwarding"),
+        x11_forwarding=pick("x11forwarding"),
+        permit_user_environment=pick("permituserenvironment"),
     )
 
 
@@ -217,7 +256,7 @@ def _root_account(host: HostObservation) -> Finding | None:
 
 
 def _with_user(key: KeyRef, user: str) -> KeyRef:
-    return KeyRef(key.fingerprint, key.type, key.kind, key.bits, key.comment, user, key.cert_authority, key.cert)
+    return dataclasses.replace(key, user=user)
 
 
 def _permit_root(value: str, raw: str) -> Finding | None:
@@ -598,10 +637,14 @@ def evaluate(host: HostObservation, push: list[KeyRef], policy: Policy) -> list[
     if root_account is not None:
         findings.append(root_account)
 
+    from keywarden.access import access_findings
+
+    findings.extend(access_findings(host, push, policy))
     return findings
 
 
 def worst(findings: list[Finding]) -> str:
+    """accepted (a waived finding) counts as a pass."""
     if any(item.severity == "fail" for item in findings):
         return "fail"
     if any(item.severity == "warn" for item in findings):

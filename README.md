@@ -11,7 +11,7 @@ One command checks this machine, one host, or every host in an Ansible inventory
 Python 3.9 or newer, on Linux or another POSIX system. No third-party packages.
 
 ```sh
-python3 -m pip install "git+https://github.com/generalwax2018/keywarden.git@v0.1.1"
+python3 -m pip install "git+https://github.com/generalwax2018/keywarden.git@v0.2.0"
 ```
 
 The distribution name is `keywarden-ssh`. The `keywarden` package on PyPI is an unrelated project; do not install it expecting this tool.
@@ -102,6 +102,14 @@ There is no scheduler. The next run is the next time you start the command.
 | `match-blocks` | `sshd_config` has `Match` blocks (warning; see below) |
 | `collector-output` | the collector output was malformed or tampered with |
 | `unreachable` | an inventory host could not be reached |
+| `key-to-root` | a key opens an account with passwordless root: `NOPASSWD` sudo to a shell or `ALL`, or a root-equivalent group such as `docker` (warning) |
+| `key-source` | a root-level key has no `from=` restriction (warning) |
+| `forced-command-forwarding` | a `command=` key still allows port or agent forwarding (warning) |
+| `key-environment` | a key sets `environment=` and `PermitUserEnvironment` is on |
+| `expired-key` | a line's `expiry-time` has passed, or cannot be read (warning) |
+| `log-level` | `LogLevel` is `QUIET`, `FATAL`, or `ERROR`, so logins are not recorded |
+| `auth-log` | the sshd log could not be read, so key usage was not checked (warning) |
+| `stale-key` | an authorized key has no login in `--stale-days` (default 90). A warning when the logs are shorter than that. |
 
 Fields that are absent from the observation are skipped, not treated as a pass.
 
@@ -112,6 +120,69 @@ Key text is fingerprinted in memory and then dropped. A private key, including a
 `forced-commands-only` is a warning. Pass `--no-weak` or `--no-outside` to skip those two comparisons.
 
 Key comments are often an email address or a machine name. Pass `--redact-comments` to leave them out of the terminal output and the report.
+
+## Access review
+
+Every check also builds a table with one row per authorized key: host, account, fingerprint, type, comment, whether it is in `--allow`, what logging in leads to (`reach`), its `from=` and other options, and when it was last used.
+
+```sh
+keywarden check --local --allow team.pub --keys
+keywarden check --inventory hosts.ini --allow team.pub --csv access-review.csv
+```
+
+`--keys` prints the table. `--csv` writes it for a spreadsheet or a ticket. The JSON report has it under `keys`. Cells that start with `=`, `+`, `-`, or `@` are prefixed with `'` so a key comment cannot run as a spreadsheet formula. A `command=` value is never printed, only that one is set, because forced commands sometimes carry tokens.
+
+**Reach.** For each account with a key, Keywarden reads `sudo -l -U <account>` and the account's groups:
+
+| Reach | Meaning |
+| --- | --- |
+| `root` | the account is root, or uid 0 |
+| `root-nopasswd` | `NOPASSWD` sudo to `ALL`, a shell, or a command with a known shell escape (`vim`, `less`, `find`, `tee`, `systemctl`, and others), or membership in `docker`, `lxd`, `lxc`, `incus-admin`, or `disk` |
+| `root-password` | the same sudo rules, but with a password; or membership in `sudo`, `wheel`, or `admin` when the rules cannot be read |
+| `limited` | sudo to specific commands that are not on the shell-escape list. The list is not exhaustive; review these rules by hand. |
+| `none` | not in sudoers, or sudo is not installed |
+| `unknown` | sudo rules could not be read (run as root or with passwordless sudo) |
+
+Each `sudo -l -U` call is written to the host's auth log by sudo itself.
+
+**Last used.** Keywarden reads `Accepted publickey for <account> ... SHA256:<fingerprint>` lines. sshd writes these at the default `LogLevel INFO`. It prefers the systemd journal, read only for `ssh.service` and `sshd.service` entries logged as uid 0, which a local user cannot forge. Without a journal it reads `/var/log/auth.log*` or `/var/log/secure*`, including rotated and gzipped files. A local user can write fake lines to those files with `logger`, so the report names which source it used (`authLog`). The log tells you how far back it reaches; a key is only called stale when the logs cover the whole `--stale-days` window. A login through a certificate counts toward the `cert-authority` line that trusted it. A certificate pasted directly into `authorized_keys` is marked `unmatched`, because sshd logs the key inside it rather than the line.
+
+Only the newest login line and a count per account and key leave the host. Pass `--redact-addresses` to drop the last login address from the output.
+
+## Find a key
+
+Offboarding someone, or a laptop was stolen: find every place their key gets in.
+
+```sh
+keywarden where --key alice.pub --inventory hosts.ini
+keywarden where SHA256:CU0yV+3RbcXlukC+M6dq938Ou+kt105Ipe/qaP4n4LU --host deploy@app-web-03.example
+```
+
+Each hit names the host, the account, whether the key is in `authorized_keys` or trusted as a `cert-authority`, its reach, its `from=` limit, and its last login. A key that logged in recently but is not in any readable `authorized_keys` is listed too: it may come from `AuthorizedKeysCommand`, another key file, or a file Keywarden could not read. Hosts and accounts that could not be read are printed on stderr, because "not found" only covers what was visible.
+
+Like `grep`, `where` exits 0 when it finds the key, 1 when it does not, and 2 on bad input. A private key passed to `--key` is refused.
+
+## Waivers
+
+Some findings are deliberate: a break-glass key on root, an admin account with passwordless sudo. Record them instead of turning the check off:
+
+```toml
+# keywarden.toml (Python 3.11+), or the same fields as JSON: {"waivers": [ {...} ]}
+[[waiver]]
+code = "root-authorized-key"
+host = "bastion-*"                # optional glob; default every host
+fingerprint = "SHA256:..."        # optional; default every key in the finding
+reason = "break-glass key, sealed in the vault"
+owner = "secops"                  # owner or ticket is required
+ticket = "SEC-1234"
+expires = "2027-03-01"            # required
+```
+
+```sh
+keywarden check --inventory hosts.ini --allow team.pub --waivers keywarden.toml
+```
+
+A waived finding is reported as `accepted`, with the reason, ticket, and end date, and does not fail the run. When a finding names several keys, it is accepted only if every key is waived; otherwise it keeps its severity and says which keys were waived. An expired waiver stops working and the finding says so. A waiver that matched nothing is printed on stderr so the file does not collect dead entries.
 
 ## Drift
 
@@ -137,7 +208,7 @@ python3 -c 'from keywarden.collect import REMOTE_SCRIPT; print(REMOTE_SCRIPT)' |
 - It does not remember a push, a host list, or a report unless you choose `--output`.
 - It does not run on a schedule or keep evidence for you. Run it from cron or CI and keep the reports you want.
 - It checks inventory hosts one at a time, up to 256 per run.
-- It reads `/etc/passwd` and `~/.ssh/authorized_keys`. Accounts that exist only in LDAP or SSSD, and keys served by `AuthorizedKeysCommand`, are not listed (the command itself is flagged).
+- It reads `/etc/passwd` and `~/.ssh/authorized_keys`. Accounts that exist only in LDAP or SSSD, and keys served by `AuthorizedKeysCommand`, are not listed (the command itself is flagged). Their logins still show up in `where`.
 
 ## Tests
 

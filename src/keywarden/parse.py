@@ -5,7 +5,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 KEY_TYPES = (
     "sk-ssh-ed25519-cert-v01@openssh.com",
@@ -54,6 +55,143 @@ class CertInfo:
         }
 
 
+# Options that turn a capability back on after "restrict".
+_REENABLE = {
+    "port-forwarding": "port",
+    "agent-forwarding": "agent",
+    "x11-forwarding": "x11",
+    "pty": "pty",
+    "user-rc": "user-rc",
+}
+_DISABLE = {
+    "no-port-forwarding": "port",
+    "no-agent-forwarding": "agent",
+    "no-x11-forwarding": "x11",
+    "no-pty": "pty",
+    "no-user-rc": "user-rc",
+}
+
+
+def parse_options(text: str) -> tuple[tuple[str, str | None], ...]:
+    """Split an authorized_keys options field. Values may be quoted and contain commas."""
+    options: list[tuple[str, str | None]] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        while index < length and text[index] in ", \t":
+            index += 1
+        start = index
+        while index < length and text[index] not in ",=":
+            index += 1
+        name = text[start:index].strip().lower()
+        value: str | None = None
+        if index < length and text[index] == "=":
+            index += 1
+            if index < length and text[index] == '"':
+                index += 1
+                chars: list[str] = []
+                while index < length and text[index] != '"':
+                    if text[index] == "\\" and index + 1 < length and text[index + 1] == '"':
+                        index += 1
+                    chars.append(text[index])
+                    index += 1
+                index += 1
+                value = "".join(chars)
+            else:
+                start = index
+                while index < length and text[index] != ",":
+                    index += 1
+                value = text[start:index]
+        if name:
+            options.append((name, value))
+    return tuple(options)
+
+
+@dataclass(frozen=True)
+class KeyOptions:
+    """What an authorized_keys line allows, before sshd's own settings apply."""
+
+    source: tuple[str, ...] = ()
+    forced_command: bool = False
+    restricted: bool = False
+    allows: frozenset[str] = frozenset({"port", "agent", "x11", "pty", "user-rc"})
+    permit_open: bool = False
+    permit_listen: bool = False
+    environment: bool = False
+    expires: int | None = None
+    expiry_unreadable: bool = False
+    principals: bool = False
+    from_unparsed: bool = False
+    names: tuple[str, ...] = field(default_factory=tuple)
+
+    def public(self) -> dict:
+        data: dict = {"restrict": self.restricted, "allows": sorted(self.allows)}
+        if self.source:
+            data["from"] = list(self.source)
+        if self.forced_command:
+            data["command"] = True
+        if self.permit_open:
+            data["permitopen"] = True
+        if self.permit_listen:
+            data["permitlisten"] = True
+        if self.environment:
+            data["environment"] = True
+        if self.expires is not None:
+            data["expiryTime"] = self.expires
+        if self.principals:
+            data["principals"] = True
+        return data
+
+
+def _expiry(value: str) -> int | None:
+    value = value.strip()
+    zone = timezone.utc if value.endswith("Z") else None
+    digits = value.rstrip("Z")
+    for pattern in ("%Y%m%d%H%M%S", "%Y%m%d%H%M", "%Y%m%d"):
+        try:
+            moment = datetime.strptime(digits, pattern)
+        except ValueError:
+            continue
+        if zone is None:
+            # sshd reads an expiry without Z in the server's local time.
+            return int(moment.timestamp())
+        return int(moment.replace(tzinfo=zone).timestamp())
+    return None
+
+
+def summarize_options(options: tuple[tuple[str, str | None], ...]) -> KeyOptions:
+    names = tuple(name for name, _value in options)
+    restricted = "restrict" in names
+    allows = set() if restricted else {"port", "agent", "x11", "pty", "user-rc"}
+    source: list[str] = []
+    expires: int | None = None
+    expiry_unreadable = False
+    for name, value in options:
+        if name in _REENABLE:
+            allows.add(_REENABLE[name])
+        elif name in _DISABLE:
+            allows.discard(_DISABLE[name])
+        elif name == "from" and value:
+            source.extend(part.strip() for part in value.split(",") if part.strip())
+        elif name == "expiry-time" and value:
+            expires = _expiry(value)
+            expiry_unreadable = expires is None
+    return KeyOptions(
+        source=tuple(source),
+        forced_command="command" in names,
+        restricted=restricted,
+        allows=frozenset(allows),
+        permit_open="permitopen" in names,
+        permit_listen="permitlisten" in names,
+        environment="environment" in names,
+        expires=expires,
+        expiry_unreadable=expiry_unreadable,
+        principals="principals" in names,
+        from_unparsed="from" in names and not source,
+        names=names,
+    )
+
+
 @dataclass(frozen=True)
 class KeyRef:
     fingerprint: str
@@ -64,6 +202,7 @@ class KeyRef:
     user: str | None = None
     cert_authority: bool = False
     cert: CertInfo | None = None
+    options: KeyOptions = field(default_factory=KeyOptions)
 
     def public(self) -> dict:
         data = {
@@ -226,8 +365,8 @@ def read_certificate(key_type: str, raw: bytes) -> CertInfo | None:
     return CertInfo(label, valid_after[0], valid_before[0], ident, fingerprint_bytes(ca[0]), False)
 
 
-def _cert_authority(options: str) -> bool:
-    return any(part.strip() == "cert-authority" for part in options.split(","))
+def _cert_authority(options: tuple[tuple[str, str | None], ...]) -> bool:
+    return any(name == "cert-authority" for name, _value in options)
 
 
 def _split_line(line: str) -> tuple[str, str, str, str] | None:
@@ -287,5 +426,18 @@ def parse_public_keys(text: str, user: str | None = None) -> tuple[list[KeyRef],
             bits = None
         if is_cert and cert is None:
             cert = CertInfo("unknown", 0, 0, "", "", True)
-        keys.append(KeyRef(fingerprint, parts[0], kind_of(parts[0]), bits, parts[2], user, _cert_authority(parts[3]), cert))
+        options = parse_options(parts[3])
+        keys.append(
+            KeyRef(
+                fingerprint,
+                parts[0],
+                kind_of(parts[0]),
+                bits,
+                parts[2],
+                user,
+                _cert_authority(options),
+                cert,
+                summarize_options(options),
+            )
+        )
     return keys, issues

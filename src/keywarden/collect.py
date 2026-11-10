@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import getpass
 import glob
+import gzip
 import os
+import time
 import re
 import shutil
 import socket
@@ -15,7 +17,8 @@ from pathlib import Path
 from keywarden.check import Account, HostObservation, SshdFacts, parse_sshd
 from keywarden.parse import parse_public_keys
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
+SUPPORTED_PROTOCOLS = {2, 3}
 
 # Address and user that sshd -T -C uses to evaluate Match blocks for root.
 # 192.0.2.1 is TEST-NET-1 and keywarden.invalid cannot resolve, so only
@@ -37,8 +40,9 @@ _ROOT_FIELDS = (
 # who controls their own file cannot write protocol markers into the stream.
 REMOTE_SCRIPT = r"""
 set -u
-echo KEYWARDEN 2
+echo KEYWARDEN 3
 echo "HOST $(hostname 2>/dev/null || echo unknown)"
+echo "NOW $(date +%s 2>/dev/null || echo unknown) $(date +%z 2>/dev/null || echo +0000)"
 P=""
 if [ "$(id -u 2>/dev/null)" = "0" ]; then
   echo PRIV root
@@ -109,6 +113,77 @@ if [ "$sshd_state" = "ok" ] && [ "$match" = "yes" ]; then
   fi
 fi
 echo ENDSSHDROOT
+# Successful public-key logins: newest line and a count per account and key.
+# The journal is read only for sshd's own units as root (_UID=0), which a local
+# user cannot forge with logger. Syslog files can be forged; the report says which was used.
+LOGAWK='
+NR == 1 { print "AUTHFIRST " $1 " " $2 " " $3 }
+/Accepted publickey for / {
+  user = ""
+  for (i = 1; i < NF; i++) if ($i == "publickey" && $(i + 1) == "for") { user = $(i + 2); break }
+  if (user == "" || !match($0, /SHA256:[A-Za-z0-9+\/]+/)) next
+  key = user " " substr($0, RSTART, RLENGTH)
+  count[key]++
+  last[key] = $0
+}
+END { for (key in count) print "L " count[key] " " last[key] }
+'
+log_source=none
+log_out=""
+if command -v journalctl >/dev/null 2>&1; then
+  log_out=$(p journalctl -q --no-pager -o short-unix _UID=0 _SYSTEMD_UNIT=ssh.service _SYSTEMD_UNIT=sshd.service 2>/dev/null | awk "$LOGAWK")
+  if [ -n "$log_out" ]; then
+    log_source=journal
+  fi
+fi
+if [ "$log_source" = "none" ]; then
+  log_files=""
+  for base in /var/log/auth.log /var/log/secure; do
+    rotated=$(ls -1 "$base".[0-9]* 2>/dev/null | sed 's/^\(.*\.\)\([0-9][0-9]*\)\(\.gz\)\{0,1\}$/\2 &/' | sort -k1,1nr | cut -d' ' -f2)
+    dated=$(ls -1 "$base"-[0-9]* 2>/dev/null | sort)
+    for candidate in $rotated $dated "$base"; do
+      if [ -e "$candidate" ]; then
+        log_files="$log_files $candidate"
+      fi
+    done
+  done
+  if [ -n "$log_files" ]; then
+    log_source=file
+    for candidate in $log_files; do
+      if ! p test -r "$candidate"; then
+        log_source=unreadable
+      fi
+    done
+    if [ "$log_source" = "file" ]; then
+      log_out=$(for candidate in $log_files; do p gzip -cdf "$candidate" 2>/dev/null; done | awk "$LOGAWK")
+    else
+      log_out=""
+    fi
+  fi
+fi
+echo "AUTHLOG $log_source"
+echo LOGINS
+if [ -n "$log_out" ]; then
+  printf '%s\n' "$log_out"
+fi
+echo ENDLOGINS
+emit_sudo() {
+  echo "GROUPS $(id -nG "$1" 2>/dev/null)"
+  if ! command -v sudo >/dev/null 2>&1; then
+    echo "SUDOSTATE absent"
+    return
+  fi
+  sudo_out=$(p sudo -n -l -U "$1" 2>&1)
+  case $sudo_out in
+    *"may run the following"*|*"not allowed to run sudo"*)
+      echo "SUDOSTATE ok"
+      echo SUDO
+      printf '%s\n' "$sudo_out" | awk '{ print "S " $0 }'
+      echo ENDSUDO
+      ;;
+    *) echo "SUDOSTATE unreadable" ;;
+  esac
+}
 mode_of() {
   target=$1
   if [ "$(access_of "$target")" = "absent" ]; then
@@ -180,6 +255,7 @@ emit_account() {
     echo ENDKEYS
     return
   fi
+  emit_sudo "$user"
   if [ "$dir_access" = "present" ]; then
     echo "DIR $(mode_of "$home/.ssh")"
     echo "FILE $(mode_of "$home/.ssh/authorized_keys")"
@@ -259,6 +335,7 @@ fi
 echo END
 """
 
+FINGERPRINT_TEXT = re.compile(r"SHA256:[A-Za-z0-9+/]+")
 _DESTINATION = re.compile(r"^[A-Za-z0-9._:-]+@[A-Za-z0-9._:-]+$|^[A-Za-z0-9._:-]+$")
 _USERNAME = re.compile(r"^[a-z_][-a-z0-9_.]*\$?$", re.IGNORECASE)
 
@@ -439,6 +516,108 @@ def _ordered_users(extra: list[str], records: dict[str, tuple[Path | None, int |
     return wanted
 
 
+_LOGIN_UNITS = ["_UID=0", "_SYSTEMD_UNIT=ssh.service", "_SYSTEMD_UNIT=sshd.service"]
+_ACCEPTED_MARK = "Accepted publickey for "
+
+
+def _group_names(user: str) -> list[str] | None:
+    completed = _run(["id", "-nG", user])
+    if completed is None or completed.returncode != 0:
+        return None
+    return completed.stdout.split()
+
+
+def _sudo_rules(user: str) -> tuple[str, list[str]]:
+    if not shutil.which("sudo"):
+        return "absent", []
+    attempts = [["sudo", "-n", "-l", "-U", user]]
+    for command in attempts:
+        completed = _run(command)
+        if completed is None:
+            continue
+        text = (completed.stdout or "") + (completed.stderr or "")
+        if "may run the following" in text or "not allowed to run sudo" in text:
+            return "ok", text.splitlines()
+    return "unreadable", []
+
+
+def _aggregate_logins(lines) -> tuple[str | None, list[str]]:
+    """Same reduction the remote awk does: newest line and a count per account and key."""
+    first: str | None = None
+    newest: dict[tuple[str, str], str] = {}
+    counts: dict[tuple[str, str], int] = {}
+    for line in lines:
+        line = line.rstrip("\n")
+        if first is None:
+            first = " ".join(line.split()[:3])
+        position = line.find(_ACCEPTED_MARK)
+        if position == -1:
+            continue
+        rest = line[position + len(_ACCEPTED_MARK):].split(" ", 1)
+        found = FINGERPRINT_TEXT.search(line)
+        if not rest or not found:
+            continue
+        key = (rest[0], found.group(0))
+        counts[key] = counts.get(key, 0) + 1
+        newest[key] = line
+    return first, [f"{counts[key]} {newest[key]}" for key in counts]
+
+
+def _log_files() -> list[str]:
+    ordered: list[str] = []
+    for base in ("/var/log/auth.log", "/var/log/secure"):
+        rotated = []
+        for path in glob.glob(base + ".[0-9]*"):
+            suffix = path[len(base) + 1 :].split(".", 1)[0]
+            if suffix.isdigit():
+                rotated.append((int(suffix), path))
+        ordered.extend(path for _number, path in sorted(rotated, reverse=True))
+        ordered.extend(sorted(glob.glob(base + "-[0-9]*")))
+        if os.path.exists(base):
+            ordered.append(base)
+    return ordered
+
+
+def _read_log_file(path: str):
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
+        yield from handle
+
+
+def _local_logins(now: int, offset: str):
+    from keywarden.access import parse_log_time, parse_login_lines
+
+    if shutil.which("journalctl"):
+        completed = _run_long(["journalctl", "-q", "--no-pager", "-o", "short-unix", *_LOGIN_UNITS])
+        if completed is not None and completed.returncode == 0 and completed.stdout.strip():
+            first, rows = _aggregate_logins(completed.stdout.splitlines())
+            since = parse_log_time(first, now, offset) if first else None
+            return "journal", since, parse_login_lines(rows, now, offset)
+    files = _log_files()
+    if not files:
+        return "none", None, {}
+    if any(not os.access(path, os.R_OK) for path in files):
+        return "unreadable", None, {}
+
+    def stream():
+        for path in files:
+            try:
+                yield from _read_log_file(path)
+            except OSError:
+                continue
+
+    first, rows = _aggregate_logins(stream())
+    since = parse_log_time(first, now, offset) if first else None
+    return "file", since, parse_login_lines(rows, now, offset)
+
+
+def _run_long(command: list[str]) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run(command, capture_output=True, text=True, timeout=60, check=False, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
 def collect_local(extra_users: list[str] | None = None) -> HostObservation:
     records, passwd_state = _passwd_records()
     accounts = []
@@ -454,8 +633,14 @@ def collect_local(extra_users: list[str] | None = None) -> HostObservation:
             account = inspect_account(user, home)
         account.uid = uid
         account.password_locked = locked
+        if account.read_state != "absent":
+            account.groups = _group_names(user)
+            account.sudo_state, account.sudo_lines = _sudo_rules(user)
         accounts.append(account)
     sshd, sshd_state, match, root = _local_sshd()
+    now = int(time.time())
+    offset = time.strftime("%z")
+    log_source, log_since, logins = _local_logins(now, offset)
     return HostObservation(
         name=socket.gethostname(),
         address="local",
@@ -468,6 +653,10 @@ def collect_local(extra_users: list[str] | None = None) -> HostObservation:
         match_blocks=match,
         sshd_root=root,
         privilege="root" if os.geteuid() == 0 else "none",
+        now=now,
+        log_source=log_source,
+        log_since=log_since,
+        logins=logins,
     )
 
 
@@ -479,7 +668,7 @@ def _malformed(index: int, why: str) -> ProtocolError:
     return ProtocolError(f"observation is malformed at line {index + 1}: {why}")
 
 
-_ACCOUNT_FIELDS = ("DIR ", "FILE ", "STATE ", "UID ", "LOCKED ")
+_ACCOUNT_FIELDS = ("DIR ", "FILE ", "STATE ", "UID ", "LOCKED ", "GROUPS ", "SUDOSTATE ")
 
 
 def parse_protocol(text: str, address: str = "observation") -> HostObservation:
@@ -495,8 +684,9 @@ def parse_protocol(text: str, address: str = "observation") -> HostObservation:
     header = lines[0].strip()
     if header == "KEYWARDEN 1":
         raise ProtocolError("observation is from an older collector (protocol 1); run the current collector again")
-    if header != f"KEYWARDEN {PROTOCOL_VERSION}":
-        raise ProtocolError("observation is not keywarden collector output")
+    version_text = header[len("KEYWARDEN "):] if header.startswith("KEYWARDEN ") else ""
+    if not version_text.isdigit() or int(version_text) not in SUPPORTED_PROTOCOLS:
+        raise ProtocolError("observation is not keywarden collector output this version can read")
 
     name = "unknown"
     privilege = "unknown"
@@ -505,6 +695,10 @@ def parse_protocol(text: str, address: str = "observation") -> HostObservation:
     sshd_lines: list[str] | None = None
     root_lines: list[str] | None = None
     passwd_state = "unknown"
+    now: int | None = None
+    offset: str | None = None
+    log_source = "unknown"
+    login_lines: list[str] | None = None
     accounts: list[Account] = []
     seen_users: set[str] = set()
     seen: set[str] = set()
@@ -552,6 +746,19 @@ def parse_protocol(text: str, address: str = "observation") -> HostObservation:
             once("MATCH", index)
             match = line[6:].strip() or "unknown"
             index += 1
+        elif line.startswith("NOW "):
+            once("NOW", index)
+            parts = line[4:].split()
+            now = int(parts[0]) if parts and parts[0].isdigit() else None
+            offset = parts[1] if len(parts) > 1 else None
+            index += 1
+        elif line.startswith("AUTHLOG "):
+            once("AUTHLOG", index)
+            log_source = line[8:].strip() or "unknown"
+            index += 1
+        elif line == "LOGINS":
+            once("LOGINS", index)
+            login_lines, index = block(index, "ENDLOGINS")
         elif line.startswith("PASSWD "):
             once("PASSWD", index)
             passwd_state = line[7:].strip() or "unknown"
@@ -576,6 +783,7 @@ def parse_protocol(text: str, address: str = "observation") -> HostObservation:
     if not ended:
         raise ProtocolError("observation is incomplete: END is missing")
     root = parse_sshd(_root_lines("\n".join(root_lines))) if root_lines else None
+    log_since, logins = _read_logins(login_lines or [], now, offset, start=0)
     return HostObservation(
         name=name,
         address=address,
@@ -588,7 +796,27 @@ def parse_protocol(text: str, address: str = "observation") -> HostObservation:
         match_blocks=match,
         sshd_root=root,
         privilege=privilege,
+        now=now,
+        log_source=log_source,
+        log_since=log_since,
+        logins=logins,
     )
+
+
+def _read_logins(lines: list[str], now: int | None, offset: str | None, start: int):
+    """LOGINS holds one AUTHFIRST line and "L <count> <log line>" rows. Nothing else."""
+    from keywarden.access import parse_log_time, parse_login_lines
+
+    since: int | None = None
+    rows: list[str] = []
+    for position, line in enumerate(lines):
+        if line.startswith("AUTHFIRST "):
+            since = parse_log_time(line[10:], now, offset)
+        elif line.startswith("L "):
+            rows.append(line[2:])
+        elif line.strip():
+            raise ProtocolError(f"observation is malformed in LOGINS (row {position + 1}): unexpected line")
+    return since, parse_login_lines(rows, now, offset)
 
 
 def _parse_account(lines: list[str], index: int) -> tuple[Account, int]:
@@ -598,8 +826,27 @@ def _parse_account(lines: list[str], index: int) -> tuple[Account, int]:
     index += 1
     fields: dict[str, str] = {}
     key_lines: list[str] | None = None
+    sudo_lines: list[str] | None = None
     while index < len(lines):
         current = lines[index]
+        if current == "SUDO":
+            if sudo_lines is not None:
+                raise _malformed(index, "SUDO appears twice for one account")
+            sudo_lines = []
+            index += 1
+            while index < len(lines) and lines[index] != "ENDSUDO":
+                entry = lines[index]
+                if entry == "S":
+                    sudo_lines.append("")
+                elif entry.startswith("S "):
+                    sudo_lines.append(entry[2:])
+                else:
+                    raise _malformed(index, "sudo line without the S prefix")
+                index += 1
+            if index >= len(lines):
+                raise _malformed(index - 1, "missing ENDSUDO")
+            index += 1
+            continue
         if current == "KEYS":
             if key_lines is not None:
                 raise _malformed(index, "KEYS appears twice for one account")
@@ -640,6 +887,10 @@ def _parse_account(lines: list[str], index: int) -> tuple[Account, int]:
     if key_lines is not None:
         key_lines.clear()
     account = Account(user, fields.get("DIR ", "unknown"), fields.get("FILE ", "unknown"), keys, state, uid, locked)
+    if "GROUPS " in fields:
+        account.groups = fields["GROUPS "].split()
+    account.sudo_state = fields.get("SUDOSTATE ", "unknown")
+    account.sudo_lines = sudo_lines or []
     return account, index
 
 

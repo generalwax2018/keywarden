@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.0 — 2026-11-10
+
+Access review: who each key lets in, as what, from where, and whether anyone still uses it.
+
+- `keywarden where` finds every host and account that accepts a key, by fingerprint or public key file, including `cert-authority` lines and recent logins from keys not in a readable file. Exits like `grep`.
+- Last use per key from sshd's own log: the systemd journal (sshd units, uid 0 only) or rotated `auth.log` / `secure` files. New `stale-key` (`--stale-days`, default 90) and `auth-log` checks. Keys are called stale only when the logs cover the whole window.
+- Reach per account from `sudo -l -U` and group membership: `root`, `root-nopasswd` (including shell-escape commands and `docker`/`lxd`/`disk` groups), `root-password`, `limited`, `none`. New `key-to-root` and `key-source` checks.
+- `authorized_keys` options are parsed: `from=`, `command=`, `restrict` and the re-enable options, forwarding, `environment=`, `expiry-time`. New `forced-command-forwarding`, `key-environment`, `expired-key`, and `log-level` checks.
+- Access review table in the JSON report (`keys`), on the terminal (`--keys`), and as CSV (`--csv`), with spreadsheet formula injection blocked.
+- Waivers (`--waivers`, JSON or TOML): accepted risks with a reason, an owner or ticket, and a required end date. Waived findings are `accepted`; expired and unused waivers are reported.
+- `--redact-addresses` drops the last login address.
+- Collector protocol 3. Output from the 0.1.1 collector (protocol 2) is still read; it has no sudo or login data, so those checks are skipped.
+
 ## 0.1.1 — 2026-11-10
 
 Security and correctness fixes found before the public release. Upgrade from 0.1.0.
