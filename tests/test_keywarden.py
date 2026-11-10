@@ -238,7 +238,7 @@ class InventoryTests(unittest.TestCase):
         )
         fingerprint = parse_public_keys(ROOT_KEY)[0][0].fingerprint
 
-        def fake(destination, extra_users=None, port=None):
+        def fake(destination, extra_users=None, port=None, accept_new=False):
             if "app-web-0" in destination:
                 name = "app-web-04" if "04" in destination else "app-web-03"
                 return parse_protocol(bad.replace("HOST app-web-03", f"HOST {name}"), address=destination)
@@ -353,6 +353,19 @@ class RootAccountTests(unittest.TestCase):
                 account.password_locked = False
                 account.uid = 0
         self.assertEqual(_codes(evaluate(parsed, [], Policy()))["root-account"], "fail")
+
+    def test_unknown_host_key_is_rejected_unless_asked(self):
+        from keywarden.collect import collect_remote
+
+        observation = TIGHT.format(ops=OPS)
+        with patch("keywarden.collect.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, observation, "")
+            collect_remote("deploy@bastion")
+            command = run.call_args.args[0]
+            self.assertIn("StrictHostKeyChecking=yes", command)
+            self.assertNotIn("StrictHostKeyChecking=accept-new", command)
+            collect_remote("deploy@bastion", accept_new=True)
+            self.assertIn("StrictHostKeyChecking=accept-new", run.call_args.args[0])
 
 
 class CertificateTests(unittest.TestCase):

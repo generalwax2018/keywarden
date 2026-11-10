@@ -114,7 +114,7 @@ def _check_one(args: argparse.Namespace) -> int:
     if args.local:
         host = collect_local(args.account)
     elif args.host:
-        host = collect_remote(args.host, args.account)
+        host = collect_remote(args.host, args.account, accept_new=args.accept_new)
     else:
         raw = read_observation(args.observation)
         try:
@@ -179,7 +179,7 @@ def _check_inventory(args: argparse.Namespace) -> int:
     plain: list[str] = []
     for target in targets:
         try:
-            observed = collect_remote(target.destination, args.account, target.port)
+            observed = collect_remote(target.destination, args.account, target.port, accept_new=args.accept_new)
         except (OSError, RuntimeError, ValueError) as exc:
             report = _unreachable(target.name, target.destination, str(exc))
             host_reports.append(report)
@@ -240,6 +240,11 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--json", action="store_true", help="print the JSON report")
     check.add_argument("--no-outside", action="store_true", help="do not flag keys missing from --allow")
     check.add_argument("--no-weak", action="store_true", help="do not flag DSA or RSA under 3072 bits")
+    check.add_argument(
+        "--accept-new",
+        action="store_true",
+        help="trust a host key that is not in known_hosts; the default is to fail that host",
+    )
     return parser
 
 

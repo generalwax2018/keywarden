@@ -11,7 +11,7 @@ This is the free release. One command checks this machine, one host, or every ho
 Python 3.9 or newer. No third-party packages.
 
 ```sh
-python3 -m pip install git+https://github.com/generalwax2018/keywarden.git
+python3 -m pip install "git+https://github.com/generalwax2018/keywarden.git@v0.1.0"
 ```
 
 Or clone this repository and run it from the tree:
@@ -45,6 +45,8 @@ keywarden check --host deploy@app-web-03.example --allow team.pub --json
 ```
 
 This is `ssh` in batch mode (no password prompt). The remote command prints `sshd -T` and `authorized_keys` back to this process. Fingerprints are computed here. Nothing is written on the remote host.
+
+A host key that is missing or changed fails the connection. Keywarden does not accept it. `--accept-new` trusts a key you have not seen before and is off unless you pass it. Use the `known_hosts` file your SSH client already has.
 
 Reading root, and reading other accounts, needs to be allowed: run as root, or have passwordless `sudo` for `sshd -T` and `cat` of `authorized_keys`. If root's file cannot be read, the root-key check is a **warning, not a pass**. A hidden root key must not look clean.
 

@@ -392,7 +392,13 @@ def parse_protocol(text: str, address: str = "observation") -> HostObservation:
     )
 
 
-def collect_remote(destination: str, extra_users: list[str] | None = None, port: int | None = None) -> HostObservation:
+def collect_remote(
+    destination: str,
+    extra_users: list[str] | None = None,
+    port: int | None = None,
+    *,
+    accept_new: bool = False,
+) -> HostObservation:
     if not _DESTINATION.fullmatch(destination) or destination.startswith("-"):
         raise ValueError("host must look like user@hostname")
     users = ["root"]
@@ -412,7 +418,7 @@ def collect_remote(destination: str, extra_users: list[str] | None = None, port:
         "-o",
         "ConnectTimeout=8",
         "-o",
-        "StrictHostKeyChecking=accept-new",
+        "StrictHostKeyChecking=accept-new" if accept_new else "StrictHostKeyChecking=yes",
         destination,
         "sh",
         "-s",

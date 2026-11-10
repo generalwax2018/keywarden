@@ -7,7 +7,7 @@ Free release. One command checks a machine, a host, or an Ansible inventory.
 - Read this machine, or one host over SSH batch mode, or collector output on stdin.
 - Walk an Ansible INI inventory. The log lists failures only. Each fingerprint is reported once, with the hosts where it failed. An unreachable host fails that host and the run continues. Passwords in the inventory are ignored.
 - Check PermitRootLogin (including `prohibit-password` and `without-password`), password and keyboard-interactive authentication, empty passwords, public-key authentication, a key on root, `.ssh` and `authorized_keys` modes, DSA and RSA under 3072 bits, and keys that are not in the set you passed with `--allow`.
-- Check the root account in passwd. A second uid 0 account fails, including one with no authorized key. An empty root password field fails. If passwd was not readable, the check is a warning.
+- An unknown or changed SSH host key fails that host. `--accept-new` is required to trust a key that is not already in `known_hosts`.
 - Refuse private-key input. Do not copy key bodies into the JSON report.
 - Check SSH certificates (validity, user versus host), `cert-authority` lines, trusted user CAs, revocation, `AuthorizedKeysCommand`, extra `AuthorizedKeysFile` paths, host-based authentication, authentication methods, and weak algorithms `sshd` still accepts.
 - Drop key text after it is fingerprinted. Refuse OpenSSH and PuTTY private keys without keeping a copy.
