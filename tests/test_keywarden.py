@@ -4,6 +4,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -200,6 +202,78 @@ class CliTests(unittest.TestCase):
             code = main(["check", "--observation", str(observation), "--allow", str(private), "--output", str(leaked)])
             self.assertEqual(code, 2)
             self.assertFalse(leaked.exists())
+
+
+class InventoryTests(unittest.TestCase):
+    def test_inventory_keeps_connection_fields_and_drops_secrets(self):
+        from keywarden.inventory import parse_inventory
+
+        hosts = parse_inventory(
+            "\n".join(
+                [
+                    "[web]",
+                    "app-[01:02] ansible_user=deploy ansible_ssh_pass=nope",
+                    "[web:vars]",
+                    "ansible_port=2222",
+                    "[jump]",
+                    "bastion ansible_host=10.0.0.9 ansible_user=ops",
+                    "[db:children]",
+                    "web",
+                ]
+            )
+        )
+        self.assertEqual([item.name for item in hosts], ["app-01", "app-02", "bastion"])
+        self.assertEqual(hosts[0].destination, "deploy@app-01")
+        self.assertEqual(hosts[0].port, 2222)
+        self.assertEqual(hosts[2].destination, "ops@10.0.0.9")
+        self.assertNotIn("nope", repr(hosts))
+
+    def test_inventory_prints_failures_only(self):
+        from keywarden.collect import parse_protocol
+        from keywarden.parse import parse_public_keys
+
+        good = TIGHT.format(ops=OPS)
+        bad = TIGHT.format(ops=ROOT_KEY).replace("HOST bastion-01", "HOST app-web-03").replace(
+            "permitrootlogin no", "permitrootlogin yes"
+        )
+        fingerprint = parse_public_keys(ROOT_KEY)[0][0].fingerprint
+
+        def fake(destination, extra_users=None, port=None):
+            if "app-web-03" in destination:
+                return parse_protocol(bad, address=destination)
+            if "down" in destination:
+                raise RuntimeError("ssh timed out before a check could finish")
+            return parse_protocol(good, address=destination)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            inventory = folder / "hosts.ini"
+            inventory.write_text(
+                "bastion-01 ansible_user=deploy\napp-web-03 ansible_user=deploy\ndown-01 ansible_user=deploy\n",
+                encoding="utf-8",
+            )
+            allow = folder / "team.pub"
+            allow.write_text(OPS + "\n", encoding="utf-8")
+            report = folder / "report.json"
+            stdout = StringIO()
+            with patch("keywarden.cli.collect_remote", fake):
+                with redirect_stdout(stdout):
+                    code = main(
+                        ["check", "--inventory", str(inventory), "--allow", str(allow), "--output", str(report)]
+                    )
+            self.assertEqual(code, 1)
+            written = report.read_text(encoding="utf-8")
+            printed = stdout.getvalue()
+            self.assertNotIn(OPS.split()[1], written)
+            self.assertNotIn(ROOT_KEY.split()[1], written)
+            self.assertIn(fingerprint, written)
+            self.assertEqual(json.loads(written)["posture"], "fail")
+            self.assertEqual(len(json.loads(written)["hosts"]), 3)
+            self.assertIn(f"app-web-03  permit-root", printed)
+            self.assertIn(f"app-web-03  outside-push  {fingerprint}", printed)
+            self.assertIn("down-01  unreachable", printed)
+            self.assertNotIn("bastion-01", printed)
+            self.assertNotIn("PASS", printed)
 
 
 class CertificateTests(unittest.TestCase):

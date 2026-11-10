@@ -4,7 +4,7 @@ Check SSH posture around the public keys you already push. Keywarden does not pu
 
 You keep using whatever already places `authorized_keys` on a machine (Ansible, a script, by hand). Keywarden reads the effective daemon config and the keys that are actually authorized, fingerprints those keys, and drops the bodies before it writes a report.
 
-This is the free release: **one host per run**. Fleet schedules, retained evidence, and sign-in are not in it.
+This is the free release. One command checks this machine, one host, or every host in an Ansible inventory. Schedules, retained evidence, and sign-in are not in it.
 
 ## Install
 
@@ -49,6 +49,24 @@ This is `ssh` in batch mode (no password prompt). The remote command prints `ssh
 Reading root, and reading other accounts, needs to be allowed: run as root, or have passwordless `sudo` for `sshd -T` and `cat` of `authorized_keys`. If root's file cannot be read, the root-key check is a **warning, not a pass**. A hidden root key must not look clean.
 
 `--account` adds a specific user. Repeat it. Accounts that already have an `authorized_keys` file are included when the file is visible.
+
+## Check an Ansible inventory
+
+```sh
+keywarden check --inventory hosts.ini --allow team.pub
+```
+
+`hosts.ini` is the INI inventory you already use. Keywarden reads `ansible_user`, `ansible_host`, and `ansible_port`. It ignores passwords, become passwords, and private-key paths in that file. Each host is one SSH, in order. A host that cannot be reached is a failure, and the rest are still checked.
+
+The terminal shows failures only: hostname, check, and fingerprint when the check is about a key. Passes are not printed. Exit 1 if any host failed. `--output` writes the JSON report, still without key bodies. `--prior` is for one host, not an inventory.
+
+```ini
+[web]
+app-web-03 ansible_user=deploy
+bastion ansible_host=10.0.0.9 ansible_user=ops ansible_port=2222
+```
+
+There is no scheduler. The next run is the next time you start the command.
 
 ## What is checked
 

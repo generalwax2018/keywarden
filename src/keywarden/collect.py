@@ -320,7 +320,7 @@ def parse_protocol(text: str, address: str = "observation") -> HostObservation:
     )
 
 
-def collect_remote(destination: str, extra_users: list[str] | None = None) -> HostObservation:
+def collect_remote(destination: str, extra_users: list[str] | None = None, port: int | None = None) -> HostObservation:
     if not _DESTINATION.fullmatch(destination) or destination.startswith("-"):
         raise ValueError("host must look like user@hostname")
     users = ["root"]
@@ -347,6 +347,10 @@ def collect_remote(destination: str, extra_users: list[str] | None = None) -> Ho
         "--",
         *users,
     ]
+    if port is not None:
+        if not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValueError("port is out of range")
+        command[1:1] = ["-p", str(port)]
     try:
         completed = subprocess.run(
             command,

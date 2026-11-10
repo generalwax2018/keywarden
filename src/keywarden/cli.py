@@ -1,18 +1,22 @@
-"""Command line. One host per run. Reports contain fingerprints only."""
+"""Command line. Reports contain fingerprints only."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
 from keywarden import __version__
 from keywarden.check import Policy, apply_drift, evaluate, worst
 from keywarden.collect import collect_local, collect_remote, now_iso, parse_protocol, read_observation
+from keywarden.inventory import parse_inventory
 from keywarden.parse import PrivateKeyError, parse_public_keys
 
 MAX_INPUT_BYTES = 1_000_000
+MAX_INVENTORY_HOSTS = 256
+_FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]+")
 
 
 def _load_allow(path: Path | None):
@@ -76,7 +80,21 @@ def _print_human(document: dict) -> None:
     print("key material omitted")
 
 
-def _check(args: argparse.Namespace) -> int:
+def _failure_rows(name: str, findings: list[dict]) -> list[str]:
+    rows = []
+    for item in findings:
+        if item.get("severity") != "fail":
+            continue
+        found = " ".join(_FINGERPRINT.findall(item.get("detail") or ""))
+        rows.append(f"{name}  {item['code']}" + (f"  {found}" if found else ""))
+    return rows
+
+
+def _policy(args: argparse.Namespace) -> Policy:
+    return Policy(flag_outside_push=not args.no_outside, flag_weak=not args.no_weak)
+
+
+def _check_one(args: argparse.Namespace) -> int:
     push = _load_allow(args.allow)
     if args.local:
         host = collect_local(args.account)
@@ -91,7 +109,7 @@ def _check(args: argparse.Namespace) -> int:
             host = parse_protocol(raw, address=address)
         finally:
             del raw
-    policy = Policy(flag_outside_push=not args.no_outside, flag_weak=not args.no_weak)
+    policy = _policy(args)
     findings = apply_drift(evaluate(host, push, policy), _load_prior(args.prior, host.name))
     document = _report(host, push, findings)
     encoded = json.dumps(document, indent=2) + "\n"
@@ -102,6 +120,81 @@ def _check(args: argparse.Namespace) -> int:
     if not args.json:
         _print_human(document)
     return 1 if host_failed(document) else 0
+
+
+def _unreachable(name: str, address: str, detail: str) -> dict:
+    return {
+        "name": name,
+        "address": address,
+        "role": "observed",
+        "observedAt": now_iso(),
+        "posture": "fail",
+        "sshd": {},
+        "findings": [
+            {
+                "code": "unreachable",
+                "severity": "fail",
+                "title": "Host could not be checked",
+                "detail": detail[:180],
+            }
+        ],
+    }
+
+
+def _check_inventory(args: argparse.Namespace) -> int:
+    if args.prior:
+        raise ValueError("--prior applies to one host; leave it off with --inventory")
+    push = _load_allow(args.allow)
+    text = args.inventory.read_text(encoding="utf-8", errors="replace")
+    try:
+        if len(text.encode("utf-8", errors="replace")) > MAX_INPUT_BYTES:
+            raise ValueError("inventory is larger than 1 MB")
+        if "PRIVATE KEY" in text or "-----BEGIN" in text or "PuTTY-User-Key-File" in text:
+            raise PrivateKeyError("private key material was present and was not recorded")
+        targets = parse_inventory(text)
+    finally:
+        del text
+    if not targets:
+        raise ValueError("inventory has no hosts")
+    if len(targets) > MAX_INVENTORY_HOSTS:
+        raise ValueError(f"inventory has more than {MAX_INVENTORY_HOSTS} hosts")
+    policy = _policy(args)
+    host_reports = []
+    rows: list[str] = []
+    for target in targets:
+        try:
+            observed = collect_remote(target.destination, args.account, target.port)
+        except (OSError, RuntimeError, ValueError) as exc:
+            report = _unreachable(target.name, target.destination, str(exc))
+            host_reports.append(report)
+            rows.append(f"{target.name}  unreachable")
+            continue
+        observed.name = target.name
+        observed.address = target.destination
+        findings = evaluate(observed, push, policy)
+        host_reports.append(_report(observed, push, findings)["host"])
+        rows.extend(_failure_rows(target.name, host_reports[-1]["findings"]))
+    posture = "fail" if any(item["posture"] == "fail" for item in host_reports) else "pass"
+    document = {
+        "product": "keywarden",
+        "version": __version__,
+        "keyMaterial": "omitted",
+        "note": "Public key bodies are not included. Fingerprints identify keys.",
+        "generatedAt": now_iso(),
+        "push": [key.public() for key in push],
+        "posture": posture,
+        "hosts": host_reports,
+    }
+    encoded = json.dumps(document, indent=2) + "\n"
+    if args.output:
+        args.output.write_text(encoded, encoding="utf-8")
+    if args.json:
+        sys.stdout.write(encoded)
+    elif rows:
+        print("\n".join(rows))
+    else:
+        print(f"{len(targets)} hosts  ok")
+    return 1 if posture == "fail" else 0
 
 
 def host_failed(document: dict) -> bool:
@@ -116,11 +209,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"keywarden {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    check = sub.add_parser("check", help="check one host")
+    check = sub.add_parser("check", help="check one host, or every host in an Ansible inventory")
     source = check.add_mutually_exclusive_group(required=True)
     source.add_argument("--local", action="store_true", help="read this machine")
     source.add_argument("--host", help="ssh to user@host in batch mode and read it")
     source.add_argument("--observation", help="collector output file, or - for stdin")
+    source.add_argument("--inventory", type=Path, help="Ansible INI inventory; failures only, one SSH per host")
     check.add_argument("--allow", type=Path, help="public keys you push; fingerprinted, not copied into the report")
     check.add_argument("--account", action="append", default=[], help="extra account to read; repeatable")
     check.add_argument("--prior", type=Path, help="earlier keywarden JSON report, for drift")
@@ -137,7 +231,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command != "check":
         parser.error("unknown command")
     try:
-        return _check(args)
+        if args.inventory:
+            return _check_inventory(args)
+        return _check_one(args)
     except PrivateKeyError:
         print(
             "Refusing to continue: a private key was in the input. Keywarden accepts public keys only and did not keep a copy.",
