@@ -78,6 +78,7 @@ There is no scheduler. The next run is the next time you start the command.
 | `empty-passwords` | `PermitEmptyPasswords` is on |
 | `pubkey-auth` | `PubkeyAuthentication` is off |
 | `root-authorized-key` | root has a key. Unreadable is a warning. |
+| `root-account` | another account has uid 0, root is missing, or root's password field is empty |
 | `permissions` | `.ssh` or `authorized_keys` is group- or world-accessible |
 | `weak-algorithm` | DSA, or RSA under 3072 bits |
 | `outside-push` | a non-root key is not in `--allow` |

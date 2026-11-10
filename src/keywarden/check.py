@@ -51,6 +51,8 @@ class Account:
     file_mode: str
     keys: list[KeyRef]
     read_state: str  # ok, absent, unreadable
+    uid: int | None = None
+    password_locked: bool | None = None
 
 
 @dataclass
@@ -61,6 +63,7 @@ class HostObservation:
     observed_at: str
     sshd: SshdFacts
     accounts: list[Account]
+    passwd_state: str = "unknown"
 
 
 @dataclass
@@ -156,6 +159,38 @@ def _describe(keys: list[KeyRef]) -> str:
 
 def _unique_count(keys: list[KeyRef]) -> int:
     return len({key.fingerprint for key in keys})
+
+
+def _root_account(host: HostObservation) -> Finding | None:
+    """Fail when passwd shows a second uid 0 account, no root, or an empty root password."""
+    if host.passwd_state == "unknown":
+        return None
+    if host.passwd_state != "ok":
+        return Finding(
+            "root-account",
+            "warn",
+            "The root account could not be listed",
+            "passwd was not readable, so another uid 0 account would be invisible.",
+        )
+    uid0 = [account for account in host.accounts if account.uid == 0]
+    aliases = [account.user for account in uid0 if account.user != "root"]
+    root = next((account for account in host.accounts if account.user == "root"), None)
+    problems: list[str] = []
+    if aliases:
+        problems.append(f"{', '.join(aliases)} has uid 0")
+    if root is None:
+        problems.append("passwd has no root user")
+    elif root.password_locked is False:
+        problems.append("root's password field is empty")
+    if problems:
+        title = "An account other than root has uid 0" if aliases else "The root account is not safe"
+        return Finding("root-account", "fail", title, ". ".join(problems) + ".")
+    return Finding(
+        "root-account",
+        "pass",
+        "The only uid 0 account is root",
+        "No other account has uid 0, and the root password field is not empty.",
+    )
 
 
 def _with_user(key: KeyRef, user: str) -> KeyRef:
@@ -514,6 +549,10 @@ def evaluate(host: HostObservation, push: list[KeyRef], policy: Policy) -> list[
             findings.append(Finding("auth-methods", "fail", "Authentication methods still allow a password", f"AuthenticationMethods is {host.sshd.authentication_methods}."))
         else:
             findings.append(Finding("auth-methods", "pass", "Authentication methods do not include a password", f"AuthenticationMethods is {host.sshd.authentication_methods}."))
+
+    root_account = _root_account(host)
+    if root_account is not None:
+        findings.append(root_account)
 
     return findings
 

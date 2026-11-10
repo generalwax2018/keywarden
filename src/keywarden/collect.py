@@ -84,7 +84,15 @@ emit_keys() {
 emit_account() {
   user=$1
   home=$2
+  uid=$3
+  locked=$4
   echo "ACCOUNT $user"
+  if [ -n "$uid" ]; then
+    echo "UID $uid"
+  fi
+  if [ -n "$locked" ]; then
+    echo "LOCKED $locked"
+  fi
   home_access=$(access_of "$home")
   dir_access=$(access_of "$home/.ssh")
   if [ "$home_access" = "unreadable" ] || [ "$dir_access" = "unreadable" ]; then
@@ -107,9 +115,27 @@ emit_account() {
   echo "FILE $(mode_of "$home/.ssh/authorized_keys")"
   emit_keys "$home/.ssh/authorized_keys"
 }
+seen_users=" "
+mark() { seen_users="$seen_users$1 "; }
+already() {
+  case $seen_users in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+locked_of() {
+  case $1 in
+    "") echo no ;;
+    x) echo unknown ;;
+    *) echo yes ;;
+  esac
+}
 for user in "$@"; do
   [ -n "$user" ] || continue
-  home=$(getent passwd "$user" 2>/dev/null | awk -F: 'NR==1 { print $6 }')
+  entry=$(getent passwd "$user" 2>/dev/null | head -n 1)
+  home=$(printf '%s' "$entry" | awk -F: 'NR==1 { print $6 }')
+  uid=$(printf '%s' "$entry" | awk -F: 'NR==1 { print $3 }')
+  pass=$(printf '%s' "$entry" | awk -F: 'NR==1 { print $2 }')
   if [ -z "${home:-}" ]; then
     echo "ACCOUNT $user"
     echo DIR unknown
@@ -117,23 +143,42 @@ for user in "$@"; do
     echo STATE unreadable
     echo KEYS
     echo ENDKEYS
+    mark "$user"
     continue
   fi
-  emit_account "$user" "$home"
+  emit_account "$user" "$home" "$uid" "$(locked_of "$pass")"
+  mark "$user"
 done
 if [ -r /etc/passwd ]; then
-  while IFS=: read -r user _pass _uid _gid _gecos home _shell; do
-    [ -n "${home:-}" ] || continue
-    [ -e "$home/.ssh/authorized_keys" ] || continue
-    skip=0
-    for seen in "$@"; do
-      if [ "$seen" = "$user" ]; then
-        skip=1
-      fi
-    done
-    [ "$skip" -eq 1 ] && continue
-    emit_account "$user" "$home"
+  echo "PASSWD ok"
+  while IFS=: read -r user pass uid _gid _gecos home _shell; do
+    [ -n "${user:-}" ] || continue
+    already "$user" && continue
+    if [ -z "${home:-}" ]; then
+      echo "ACCOUNT $user"
+      echo "UID $uid"
+      echo "LOCKED $(locked_of "$pass")"
+      echo DIR absent
+      echo FILE absent
+      echo STATE absent
+      echo KEYS
+      echo ENDKEYS
+      mark "$user"
+      continue
+    fi
+    want=0
+    if [ "${uid:-}" = "0" ]; then
+      want=1
+    fi
+    if [ -n "${home:-}" ] && [ -e "$home/.ssh/authorized_keys" ]; then
+      want=1
+    fi
+    [ "$want" -eq 1 ] || continue
+    emit_account "$user" "${home:-/}" "$uid" "$(locked_of "$pass")"
+    mark "$user"
   done < /etc/passwd
+else
+  echo "PASSWD unreadable"
 fi
 echo END
 """
@@ -195,18 +240,27 @@ def inspect_account(user: str, home: Path) -> Account:
     return Account(user, file_mode(ssh_dir), file_mode(key_file), keys, "ok")
 
 
-def _passwd_homes() -> dict[str, Path]:
-    homes: dict[str, Path] = {}
+def _password_locked(field: str) -> bool | None:
+    if field == "":
+        return False
+    if field == "x":
+        return None
+    return True
+
+
+def _passwd_records() -> tuple[dict[str, tuple[Path, int | None, bool | None]], str]:
+    records: dict[str, tuple[Path, int | None, bool | None]] = {}
     try:
         text = Path("/etc/passwd").read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return homes
+        return records, "unreadable"
     for line in text.splitlines():
         parts = line.split(":")
         if len(parts) < 6 or not parts[0] or not parts[5]:
             continue
-        homes[parts[0]] = Path(parts[5])
-    return homes
+        uid = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+        records[parts[0]] = (Path(parts[5]), uid, _password_locked(parts[1] if len(parts) > 1 else "x"))
+    return records, "ok"
 
 
 def _sshd_text() -> str:
@@ -223,7 +277,7 @@ def _sshd_text() -> str:
     return completed.stdout or ""
 
 
-def _ordered_users(extra: list[str], homes: dict[str, Path]) -> list[str]:
+def _ordered_users(extra: list[str], records: dict[str, tuple[Path, int | None, bool | None]]) -> list[str]:
     wanted: list[str] = []
 
     def add(user: str) -> None:
@@ -236,21 +290,25 @@ def _ordered_users(extra: list[str], homes: dict[str, Path]) -> list[str]:
         if not _USERNAME.fullmatch(user):
             raise ValueError(f"not a username: {user}")
         add(user)
-    for user, home in homes.items():
-        if (home / ".ssh" / "authorized_keys").exists():
+    for user, (home, uid, _locked) in records.items():
+        if uid == 0 or (home / ".ssh" / "authorized_keys").exists():
             add(user)
     return wanted
 
 
 def collect_local(extra_users: list[str] | None = None) -> HostObservation:
-    homes = _passwd_homes()
+    records, passwd_state = _passwd_records()
     accounts = []
-    for user in _ordered_users(extra_users or [], homes):
-        home = homes.get(user)
-        if home is None:
+    for user in _ordered_users(extra_users or [], records):
+        record = records.get(user)
+        if record is None:
             accounts.append(Account(user, "unknown", "unknown", [], "unreadable"))
-        else:
-            accounts.append(inspect_account(user, home))
+            continue
+        home, uid, locked = record
+        account = inspect_account(user, home)
+        account.uid = uid
+        account.password_locked = locked
+        accounts.append(account)
     return HostObservation(
         name=socket.gethostname(),
         address="local",
@@ -258,6 +316,7 @@ def collect_local(extra_users: list[str] | None = None) -> HostObservation:
         observed_at=now_iso(),
         sshd=parse_sshd(_sshd_text()),
         accounts=accounts,
+        passwd_state=passwd_state,
     )
 
 
@@ -268,11 +327,16 @@ def parse_protocol(text: str, address: str = "observation") -> HostObservation:
     name = "unknown"
     sshd_lines: list[str] = []
     accounts: list[Account] = []
+    passwd_state = "unknown"
     index = 1
     while index < len(lines):
         line = lines[index]
         if line.startswith("HOST "):
             name = line[5:].strip() or "unknown"
+            index += 1
+            continue
+        if line.startswith("PASSWD "):
+            passwd_state = line[7:].strip() or "unknown"
             index += 1
             continue
         if line == "SSHD":
@@ -288,6 +352,8 @@ def parse_protocol(text: str, address: str = "observation") -> HostObservation:
             dir_mode = "unknown"
             file_mode = "unknown"
             state = "unreadable"
+            uid: int | None = None
+            locked: bool | None = None
             key_lines: list[str] = []
             while index < len(lines) and not lines[index].startswith("ACCOUNT ") and lines[index] != "END":
                 current = lines[index]
@@ -297,6 +363,11 @@ def parse_protocol(text: str, address: str = "observation") -> HostObservation:
                     file_mode = current[5:].strip()
                 elif current.startswith("STATE "):
                     state = current[6:].strip()
+                elif current.startswith("UID "):
+                    raw_uid = current[4:].strip()
+                    uid = int(raw_uid) if raw_uid.isdigit() else None
+                elif current.startswith("LOCKED "):
+                    locked = {"yes": True, "no": False}.get(current[7:].strip().lower())
                 elif current == "KEYS":
                     index += 1
                     while index < len(lines) and lines[index] != "ENDKEYS":
@@ -307,7 +378,7 @@ def parse_protocol(text: str, address: str = "observation") -> HostObservation:
                 keys, _issues = parse_public_keys("\n".join(key_lines), user)
             else:
                 keys = []
-            accounts.append(Account(user, dir_mode, file_mode, keys, state))
+            accounts.append(Account(user, dir_mode, file_mode, keys, state, uid, locked))
             continue
         index += 1
     return HostObservation(
@@ -317,6 +388,7 @@ def parse_protocol(text: str, address: str = "observation") -> HostObservation:
         observed_at=now_iso(),
         sshd=parse_sshd("\n".join(sshd_lines)),
         accounts=accounts,
+        passwd_state=passwd_state,
     )
 
 

@@ -309,6 +309,52 @@ class InventoryTests(unittest.TestCase):
         self.assertIn("A key is not in the push", outside.title)
 
 
+class RootAccountTests(unittest.TestCase):
+    def _with_passwd(self, body: str) -> str:
+        return TIGHT.format(ops=OPS).replace("ENDSSHD\n", "ENDSSHD\n" + body, 1)
+
+    def test_observation_without_passwd_does_not_invent_a_result(self):
+        host = parse_protocol(TIGHT.format(ops=OPS))
+        self.assertNotIn("root-account", _codes(evaluate(host, [], Policy())))
+
+    def test_second_uid_zero_fails_even_without_a_key(self):
+        text = self._with_passwd(
+            "\n".join(
+                [
+                    "PASSWD ok",
+                    "ACCOUNT toor",
+                    "UID 0",
+                    "LOCKED yes",
+                    "DIR absent",
+                    "FILE absent",
+                    "STATE absent",
+                    "KEYS",
+                    "ENDKEYS",
+                    "",
+                ]
+            )
+        )
+        host = parse_protocol(text)
+        self.assertEqual(host.passwd_state, "ok")
+        self.assertEqual(_codes(evaluate(host, [], Policy()))["root-account"], "fail")
+
+    def test_only_root_passes_and_an_empty_password_fails(self):
+        clean = self._with_passwd("PASSWD ok\nACCOUNT root\nUID 0\nLOCKED yes\n")
+        # The fixture already has an ACCOUNT root block; a second one is the same user.
+        host = parse_protocol(clean)
+        root = next(account for account in host.accounts if account.user == "root" and account.uid == 0)
+        self.assertEqual(root.uid, 0)
+        self.assertEqual(_codes(evaluate(host, [], Policy()))["root-account"], "pass")
+
+        empty = self._with_passwd("PASSWD ok\n")
+        parsed = parse_protocol(empty)
+        for account in parsed.accounts:
+            if account.user == "root":
+                account.password_locked = False
+                account.uid = 0
+        self.assertEqual(_codes(evaluate(parsed, [], Policy()))["root-account"], "fail")
+
+
 class CertificateTests(unittest.TestCase):
     def _signed(self, folder: Path, validity: str, host: bool = False, name: str = "user") -> tuple[str, str]:
         ca = folder / f"{name}-ca"
