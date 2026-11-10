@@ -1,15 +1,17 @@
 [project]
-name = "keywarden"
-version = "0.1.0"
+name = "keywarden-ssh"
+version = "0.1.1"
 description = "Check SSH posture around the public keys you push. Never stores them."
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 authors = [{ name = "Michael Waxman" }]
 keywords = ["ssh", "security", "authorized_keys"]
 classifiers = [
   "Environment :: Console",
-  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3",
   "Topic :: Security",
 ]
@@ -18,12 +20,14 @@ dependencies = []
 [project.urls]
 Homepage = "https://github.com/generalwax2018/keywarden"
 Repository = "https://github.com/generalwax2018/keywarden"
+Issues = "https://github.com/generalwax2018/keywarden/issues"
+Changelog = "https://github.com/generalwax2018/keywarden/blob/main/CHANGELOG.md"
 
 [project.scripts]
 keywarden = "keywarden.cli:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

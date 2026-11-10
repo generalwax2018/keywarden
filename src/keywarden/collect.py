@@ -3,44 +3,131 @@
 from __future__ import annotations
 
 import getpass
+import glob
+import os
 import re
+import shutil
 import socket
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-from keywarden.check import Account, HostObservation, parse_sshd
+from keywarden.check import Account, HostObservation, SshdFacts, parse_sshd
 from keywarden.parse import parse_public_keys
 
+PROTOCOL_VERSION = 2
+
+# Address and user that sshd -T -C uses to evaluate Match blocks for root.
+# 192.0.2.1 is TEST-NET-1 and keywarden.invalid cannot resolve, so only
+# "Match User root" style blocks apply, not address or host blocks.
+ROOT_MATCH_SPEC = "user=root,host=keywarden.invalid,addr=192.0.2.1"
+SSHD_CANDIDATES = ("sshd", "/usr/sbin/sshd", "/usr/local/sbin/sshd", "/sbin/sshd")
+SSHD_CONFIG_GLOBS = ("/etc/ssh/sshd_config", "/etc/ssh/sshd_config.d/*.conf")
+_MATCH_LINE = re.compile(r"^\s*Match\s", re.IGNORECASE | re.MULTILINE)
+_ROOT_FIELDS = (
+    "permitrootlogin",
+    "passwordauthentication",
+    "kbdinteractiveauthentication",
+    "authenticationmethods",
+    "pubkeyauthentication",
+)
+
 # Fixed script. Usernames arrive as arguments, never interpolated.
+# Every line read from an authorized_keys file is prefixed with "K " so a user
+# who controls their own file cannot write protocol markers into the stream.
 REMOTE_SCRIPT = r"""
 set -u
-echo KEYWARDEN 1
+echo KEYWARDEN 2
 echo "HOST $(hostname 2>/dev/null || echo unknown)"
+P=""
+if [ "$(id -u 2>/dev/null)" = "0" ]; then
+  echo PRIV root
+elif sudo -n true </dev/null >/dev/null 2>&1; then
+  P=sudo
+  echo PRIV sudo
+else
+  echo PRIV none
+fi
+p() {
+  if [ -n "$P" ]; then
+    sudo -n "$@" </dev/null
+  else
+    "$@" </dev/null
+  fi
+}
+SSHD_BIN=""
+for candidate in sshd /usr/sbin/sshd /usr/local/sbin/sshd /sbin/sshd; do
+  if command -v "$candidate" >/dev/null 2>&1; then
+    SSHD_BIN=$(command -v "$candidate")
+    break
+  fi
+done
+sshd_state=missing
+sshd_out=""
+if [ -n "$SSHD_BIN" ]; then
+  if sshd_out=$(p "$SSHD_BIN" -T 2>/dev/null); then
+    sshd_state=ok
+  elif sshd_out=$(sudo -n "$SSHD_BIN" -T </dev/null 2>/dev/null); then
+    sshd_state=ok
+  else
+    sshd_state=failed
+    sshd_out=""
+  fi
+fi
+echo "SSHDRUN $sshd_state"
 echo SSHD
-if command -v sshd >/dev/null 2>&1; then
-  sshd -T 2>/dev/null || sudo -n sshd -T 2>/dev/null || true
+if [ -n "$sshd_out" ]; then
+  printf '%s\n' "$sshd_out"
 fi
 echo ENDSSHD
+cfgs=/etc/ssh/sshd_config
+for extra in /etc/ssh/sshd_config.d/*.conf; do
+  if [ -e "$extra" ]; then
+    cfgs="$cfgs $extra"
+  fi
+done
+match=unknown
+if p grep -Eqs '^[[:space:]]*[Mm][Aa][Tt][Cc][Hh][[:space:]]' $cfgs; then
+  match=yes
+else
+  status=$?
+  if [ "$status" -eq 1 ]; then
+    match=no
+  fi
+fi
+echo "MATCH $match"
+echo SSHDROOT
+if [ "$sshd_state" = "ok" ] && [ "$match" = "yes" ]; then
+  root_out=""
+  if root_out=$(p "$SSHD_BIN" -T -C user=root,host=keywarden.invalid,addr=192.0.2.1 2>/dev/null); then
+    :
+  else
+    root_out=$(sudo -n "$SSHD_BIN" -T -C user=root,host=keywarden.invalid,addr=192.0.2.1 </dev/null 2>/dev/null || true)
+  fi
+  if [ -n "$root_out" ]; then
+    printf '%s\n' "$root_out" | grep -Ei '^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|authenticationmethods|pubkeyauthentication) ' || true
+  fi
+fi
+echo ENDSSHDROOT
 mode_of() {
   target=$1
-  if [ ! -e "$target" ]; then
+  if [ "$(access_of "$target")" = "absent" ]; then
     echo absent
     return
   fi
-  if stat -c %a "$target" >/dev/null 2>&1; then
-    stat -c %a "$target" 2>/dev/null || echo unknown
+  if p stat -c %a "$target" >/dev/null 2>&1; then
+    p stat -c %a "$target" 2>/dev/null || echo unknown
     return
   fi
-  stat -f %OLp "$target" 2>/dev/null || echo unknown
+  p stat -f %OLp "$target" 2>/dev/null || echo unknown
 }
 access_of() {
   target=$1
-  if [ -e "$target" ] || [ -L "$target" ]; then
+  if p test -e "$target" || p test -L "$target"; then
     echo present
     return
   fi
-  err=$(ls -ld "$target" 2>&1 >/dev/null)
+  err=$(p ls -ld "$target" 2>&1 >/dev/null)
   case $err in
     *[Pp]ermission*denied*|*[Nn]ot\ permitted*) echo unreadable ;;
     *) echo absent ;;
@@ -48,32 +135,23 @@ access_of() {
 }
 emit_keys() {
   keyfile=$1
-  access=$(access_of "$keyfile")
-  if [ "$access" = "absent" ]; then
+  if [ "$(access_of "$keyfile")" = "absent" ]; then
     echo STATE absent
     echo KEYS
     echo ENDKEYS
     return
   fi
-  if [ "$access" = "unreadable" ]; then
-    echo STATE unreadable
+  if p test -r "$keyfile" && p cat "$keyfile" >/dev/null 2>&1; then
+    echo STATE ok
     echo KEYS
+    p cat "$keyfile" 2>/dev/null | awk '{ print "K " $0 }'
     echo ENDKEYS
     return
   fi
-  if [ -r "$keyfile" ]; then
+  if [ -z "$P" ] && sudo -n cat "$keyfile" </dev/null >/dev/null 2>&1; then
     echo STATE ok
     echo KEYS
-    cat "$keyfile"
-    echo
-    echo ENDKEYS
-    return
-  fi
-  if sudo -n test -r "$keyfile" 2>/dev/null; then
-    echo STATE ok
-    echo KEYS
-    sudo -n cat "$keyfile"
-    echo
+    sudo -n cat "$keyfile" </dev/null 2>/dev/null | awk '{ print "K " $0 }'
     echo ENDKEYS
     return
   fi
@@ -93,16 +171,7 @@ emit_account() {
   if [ -n "$locked" ]; then
     echo "LOCKED $locked"
   fi
-  home_access=$(access_of "$home")
   dir_access=$(access_of "$home/.ssh")
-  if [ "$home_access" = "unreadable" ] || [ "$dir_access" = "unreadable" ]; then
-    echo DIR unknown
-    echo FILE unknown
-    echo STATE unreadable
-    echo KEYS
-    echo ENDKEYS
-    return
-  fi
   if [ "$dir_access" = "absent" ]; then
     echo DIR absent
     echo FILE absent
@@ -111,8 +180,13 @@ emit_account() {
     echo ENDKEYS
     return
   fi
-  echo "DIR $(mode_of "$home/.ssh")"
-  echo "FILE $(mode_of "$home/.ssh/authorized_keys")"
+  if [ "$dir_access" = "present" ]; then
+    echo "DIR $(mode_of "$home/.ssh")"
+    echo "FILE $(mode_of "$home/.ssh/authorized_keys")"
+  else
+    echo DIR unknown
+    echo FILE unknown
+  fi
   emit_keys "$home/.ssh/authorized_keys"
 }
 seen_users=" "
@@ -132,6 +206,7 @@ locked_of() {
 }
 for user in "$@"; do
   [ -n "$user" ] || continue
+  already "$user" && continue
   entry=$(getent passwd "$user" 2>/dev/null | head -n 1)
   home=$(printf '%s' "$entry" | awk -F: 'NR==1 { print $6 }')
   uid=$(printf '%s' "$entry" | awk -F: 'NR==1 { print $3 }')
@@ -155,26 +230,27 @@ if [ -r /etc/passwd ]; then
     [ -n "${user:-}" ] || continue
     already "$user" && continue
     if [ -z "${home:-}" ]; then
-      echo "ACCOUNT $user"
-      echo "UID $uid"
-      echo "LOCKED $(locked_of "$pass")"
-      echo DIR absent
-      echo FILE absent
-      echo STATE absent
-      echo KEYS
-      echo ENDKEYS
-      mark "$user"
+      if [ "${uid:-}" = "0" ]; then
+        echo "ACCOUNT $user"
+        echo "UID $uid"
+        echo "LOCKED $(locked_of "$pass")"
+        echo DIR absent
+        echo FILE absent
+        echo STATE absent
+        echo KEYS
+        echo ENDKEYS
+        mark "$user"
+      fi
       continue
     fi
     want=0
     if [ "${uid:-}" = "0" ]; then
       want=1
-    fi
-    if [ -n "${home:-}" ] && [ -e "$home/.ssh/authorized_keys" ]; then
+    elif [ "$(access_of "$home/.ssh/authorized_keys")" != "absent" ]; then
       want=1
     fi
     [ "$want" -eq 1 ] || continue
-    emit_account "$user" "${home:-/}" "$uid" "$(locked_of "$pass")"
+    emit_account "$user" "$home" "$uid" "$(locked_of "$pass")"
     mark "$user"
   done < /etc/passwd
 else
@@ -207,15 +283,18 @@ def _access(path: Path) -> str:
         path.lstat()
     except FileNotFoundError:
         return "absent"
+    except NotADirectoryError:
+        return "absent"
     except OSError:
         return "unreadable"
     return "present"
 
 
 def inspect_account(user: str, home: Path) -> Account:
-    if _access(home) == "absent":
+    home_state = _access(home)
+    if home_state == "absent":
         return Account(user, "absent", "absent", [], "absent")
-    if _access(home) == "unreadable":
+    if home_state == "unreadable":
         return Account(user, "unknown", "unknown", [], "unreadable")
     ssh_dir = home / ".ssh"
     dir_state = _access(ssh_dir)
@@ -248,36 +327,96 @@ def _password_locked(field: str) -> bool | None:
     return True
 
 
-def _passwd_records() -> tuple[dict[str, tuple[Path, int | None, bool | None]], str]:
-    records: dict[str, tuple[Path, int | None, bool | None]] = {}
+def _passwd_records() -> tuple[dict[str, tuple[Path | None, int | None, bool | None]], str]:
+    records: dict[str, tuple[Path | None, int | None, bool | None]] = {}
     try:
         text = Path("/etc/passwd").read_text(encoding="utf-8", errors="replace")
     except OSError:
         return records, "unreadable"
     for line in text.splitlines():
         parts = line.split(":")
-        if len(parts) < 6 or not parts[0] or not parts[5]:
+        if len(parts) < 6 or not parts[0]:
             continue
-        uid = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
-        records[parts[0]] = (Path(parts[5]), uid, _password_locked(parts[1] if len(parts) > 1 else "x"))
+        uid = int(parts[2]) if parts[2].isdigit() else None
+        home = Path(parts[5]) if parts[5] else None
+        if home is None and uid != 0:
+            continue
+        records[parts[0]] = (home, uid, _password_locked(parts[1]))
     return records, "ok"
 
 
-def _sshd_text() -> str:
+def _sshd_binary() -> str | None:
+    for candidate in SSHD_CANDIDATES:
+        found = shutil.which(candidate)
+        if found:
+            return found
+    return None
+
+
+def _run(command: list[str]) -> subprocess.CompletedProcess | None:
     try:
-        completed = subprocess.run(
-            ["sshd", "-T"],
+        return subprocess.run(
+            command,
             capture_output=True,
             text=True,
             timeout=10,
             check=False,
+            stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return completed.stdout or ""
+        return None
 
 
-def _ordered_users(extra: list[str], records: dict[str, tuple[Path, int | None, bool | None]]) -> list[str]:
+def _sshd_output(binary: str, extra: list[str]) -> str | None:
+    attempts = [[binary, "-T", *extra]]
+    if os.geteuid() != 0 and shutil.which("sudo"):
+        attempts.append(["sudo", "-n", binary, "-T", *extra])
+    for command in attempts:
+        completed = _run(command)
+        if completed is not None and completed.returncode == 0 and completed.stdout:
+            return completed.stdout
+    return None
+
+
+def _match_state() -> str:
+    paths: list[str] = []
+    for pattern in SSHD_CONFIG_GLOBS:
+        paths.extend(sorted(glob.glob(pattern)))
+    if not paths:
+        return "unknown"
+    unreadable = False
+    for path in paths:
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            unreadable = True
+            continue
+        if _MATCH_LINE.search(text):
+            return "yes"
+    return "unknown" if unreadable else "no"
+
+
+def _root_lines(text: str) -> str:
+    return "\n".join(line for line in text.splitlines() if line.split(" ", 1)[0].lower() in _ROOT_FIELDS)
+
+
+def _local_sshd() -> tuple[SshdFacts, str, str, SshdFacts | None]:
+    binary = _sshd_binary()
+    match = _match_state()
+    if binary is None:
+        return parse_sshd(""), "missing", match, None
+    text = _sshd_output(binary, [])
+    if text is None:
+        return parse_sshd(""), "failed", match, None
+    root = None
+    if match == "yes":
+        root_text = _sshd_output(binary, ["-C", ROOT_MATCH_SPEC])
+        if root_text:
+            root = parse_sshd(_root_lines(root_text))
+    return parse_sshd(text), "ok", match, root
+
+
+def _ordered_users(extra: list[str], records: dict[str, tuple[Path | None, int | None, bool | None]]) -> list[str]:
     wanted: list[str] = []
 
     def add(user: str) -> None:
@@ -291,7 +430,11 @@ def _ordered_users(extra: list[str], records: dict[str, tuple[Path, int | None, 
             raise ValueError(f"not a username: {user}")
         add(user)
     for user, (home, uid, _locked) in records.items():
-        if uid == 0 or (home / ".ssh" / "authorized_keys").exists():
+        if uid == 0:
+            add(user)
+        elif home is not None and _access(home / ".ssh" / "authorized_keys") != "absent":
+            # Present, or hidden behind a permission error. A hidden file is
+            # reported as unreadable, never skipped.
             add(user)
     return wanted
 
@@ -305,91 +448,199 @@ def collect_local(extra_users: list[str] | None = None) -> HostObservation:
             accounts.append(Account(user, "unknown", "unknown", [], "unreadable"))
             continue
         home, uid, locked = record
-        account = inspect_account(user, home)
+        if home is None:
+            account = Account(user, "absent", "absent", [], "absent")
+        else:
+            account = inspect_account(user, home)
         account.uid = uid
         account.password_locked = locked
         accounts.append(account)
+    sshd, sshd_state, match, root = _local_sshd()
     return HostObservation(
         name=socket.gethostname(),
         address="local",
         role="local",
         observed_at=now_iso(),
-        sshd=parse_sshd(_sshd_text()),
+        sshd=sshd,
         accounts=accounts,
         passwd_state=passwd_state,
+        sshd_state=sshd_state,
+        match_blocks=match,
+        sshd_root=root,
+        privilege="root" if os.geteuid() == 0 else "none",
     )
 
 
+class ProtocolError(ValueError):
+    """Collector output was not well formed. Nothing from it is trusted."""
+
+
+def _malformed(index: int, why: str) -> ProtocolError:
+    return ProtocolError(f"observation is malformed at line {index + 1}: {why}")
+
+
+_ACCOUNT_FIELDS = ("DIR ", "FILE ", "STATE ", "UID ", "LOCKED ")
+
+
 def parse_protocol(text: str, address: str = "observation") -> HostObservation:
+    """Parse collector output strictly.
+
+    Each section may appear once, key lines must carry the "K " prefix, and the
+    stream must end with END. Anything else is refused rather than guessed at,
+    so text inside an authorized_keys file cannot rewrite the observation.
+    """
     lines = text.splitlines()
-    if not lines or not lines[0].startswith("KEYWARDEN "):
-        raise ValueError("observation is not keywarden collector output")
+    if not lines:
+        raise ProtocolError("observation is empty")
+    header = lines[0].strip()
+    if header == "KEYWARDEN 1":
+        raise ProtocolError("observation is from an older collector (protocol 1); run the current collector again")
+    if header != f"KEYWARDEN {PROTOCOL_VERSION}":
+        raise ProtocolError("observation is not keywarden collector output")
+
     name = "unknown"
-    sshd_lines: list[str] = []
-    accounts: list[Account] = []
+    privilege = "unknown"
+    sshd_state = "unknown"
+    match = "unknown"
+    sshd_lines: list[str] | None = None
+    root_lines: list[str] | None = None
     passwd_state = "unknown"
+    accounts: list[Account] = []
+    seen_users: set[str] = set()
+    seen: set[str] = set()
+    ended = False
+
+    def once(tag: str, index: int) -> None:
+        if tag in seen:
+            raise _malformed(index, f"{tag} appears twice")
+        seen.add(tag)
+
+    def block(index: int, end: str) -> tuple[list[str], int]:
+        body: list[str] = []
+        index += 1
+        while index < len(lines) and lines[index] != end:
+            body.append(lines[index])
+            index += 1
+        if index >= len(lines):
+            raise _malformed(index - 1, f"missing {end}")
+        return body, index + 1
+
     index = 1
     while index < len(lines):
         line = lines[index]
+        if ended:
+            if line.strip():
+                raise _malformed(index, "text after END")
+            index += 1
+            continue
+        if not line.strip():
+            index += 1
+            continue
         if line.startswith("HOST "):
+            once("HOST", index)
             name = line[5:].strip() or "unknown"
             index += 1
-            continue
-        if line.startswith("PASSWD "):
+        elif line.startswith("PRIV "):
+            once("PRIV", index)
+            privilege = line[5:].strip() or "unknown"
+            index += 1
+        elif line.startswith("SSHDRUN "):
+            once("SSHDRUN", index)
+            sshd_state = line[8:].strip() or "unknown"
+            index += 1
+        elif line.startswith("MATCH "):
+            once("MATCH", index)
+            match = line[6:].strip() or "unknown"
+            index += 1
+        elif line.startswith("PASSWD "):
+            once("PASSWD", index)
             passwd_state = line[7:].strip() or "unknown"
             index += 1
-            continue
-        if line == "SSHD":
+        elif line == "SSHD":
+            once("SSHD", index)
+            sshd_lines, index = block(index, "ENDSSHD")
+        elif line == "SSHDROOT":
+            once("SSHDROOT", index)
+            root_lines, index = block(index, "ENDSSHDROOT")
+        elif line.startswith("ACCOUNT "):
+            account, index = _parse_account(lines, index)
+            if account.user in seen_users:
+                raise _malformed(index - 1, f"account {account.user} appears twice")
+            seen_users.add(account.user)
+            accounts.append(account)
+        elif line == "END":
+            ended = True
             index += 1
-            while index < len(lines) and lines[index] != "ENDSSHD":
-                sshd_lines.append(lines[index])
-                index += 1
-            index += 1
-            continue
-        if line.startswith("ACCOUNT "):
-            user = line[8:].strip() or "unknown"
-            index += 1
-            dir_mode = "unknown"
-            file_mode = "unknown"
-            state = "unreadable"
-            uid: int | None = None
-            locked: bool | None = None
-            key_lines: list[str] = []
-            while index < len(lines) and not lines[index].startswith("ACCOUNT ") and lines[index] != "END":
-                current = lines[index]
-                if current.startswith("DIR "):
-                    dir_mode = current[4:].strip()
-                elif current.startswith("FILE "):
-                    file_mode = current[5:].strip()
-                elif current.startswith("STATE "):
-                    state = current[6:].strip()
-                elif current.startswith("UID "):
-                    raw_uid = current[4:].strip()
-                    uid = int(raw_uid) if raw_uid.isdigit() else None
-                elif current.startswith("LOCKED "):
-                    locked = {"yes": True, "no": False}.get(current[7:].strip().lower())
-                elif current == "KEYS":
-                    index += 1
-                    while index < len(lines) and lines[index] != "ENDKEYS":
-                        key_lines.append(lines[index])
-                        index += 1
-                index += 1
-            if state == "ok":
-                keys, _issues = parse_public_keys("\n".join(key_lines), user)
-            else:
-                keys = []
-            accounts.append(Account(user, dir_mode, file_mode, keys, state, uid, locked))
-            continue
-        index += 1
+        else:
+            raise _malformed(index, "unexpected line")
+    if not ended:
+        raise ProtocolError("observation is incomplete: END is missing")
+    root = parse_sshd(_root_lines("\n".join(root_lines))) if root_lines else None
     return HostObservation(
         name=name,
         address=address,
         role="observed",
         observed_at=now_iso(),
-        sshd=parse_sshd("\n".join(sshd_lines)),
+        sshd=parse_sshd("\n".join(sshd_lines or [])),
         accounts=accounts,
         passwd_state=passwd_state,
+        sshd_state=sshd_state,
+        match_blocks=match,
+        sshd_root=root,
+        privilege=privilege,
     )
+
+
+def _parse_account(lines: list[str], index: int) -> tuple[Account, int]:
+    user = lines[index][8:].strip()
+    if not _USERNAME.fullmatch(user):
+        raise _malformed(index, "account name is not a username")
+    index += 1
+    fields: dict[str, str] = {}
+    key_lines: list[str] | None = None
+    while index < len(lines):
+        current = lines[index]
+        if current == "KEYS":
+            if key_lines is not None:
+                raise _malformed(index, "KEYS appears twice for one account")
+            key_lines = []
+            index += 1
+            while index < len(lines) and lines[index] != "ENDKEYS":
+                entry = lines[index]
+                if entry == "K":
+                    key_lines.append("")
+                elif entry.startswith("K "):
+                    key_lines.append(entry[2:])
+                else:
+                    raise _malformed(index, "key line without the K prefix")
+                index += 1
+            if index >= len(lines):
+                raise _malformed(index - 1, "missing ENDKEYS")
+            index += 1
+            break
+        tag = next((prefix for prefix in _ACCOUNT_FIELDS if current.startswith(prefix)), None)
+        if tag is None:
+            break
+        if tag in fields:
+            raise _malformed(index, f"{tag.strip()} appears twice for one account")
+        fields[tag] = current[len(tag) :].strip()
+        index += 1
+    state = fields.get("STATE ", "unreadable")
+    uid_text = fields.get("UID ")
+    uid = int(uid_text) if uid_text and uid_text.isdigit() else None
+    locked = {"yes": True, "no": False}.get(fields.get("LOCKED ", "").lower())
+    if state == "ok":
+        joined = "\n".join(key_lines or [])
+        try:
+            keys, _issues = parse_public_keys(joined, user)
+        finally:
+            del joined
+    else:
+        keys = []
+    if key_lines is not None:
+        key_lines.clear()
+    account = Account(user, fields.get("DIR ", "unknown"), fields.get("FILE ", "unknown"), keys, state, uid, locked)
+    return account, index
 
 
 def collect_remote(
@@ -398,6 +649,7 @@ def collect_remote(
     port: int | None = None,
     *,
     accept_new: bool = False,
+    identity_file: str | None = None,
 ) -> HostObservation:
     if not _DESTINATION.fullmatch(destination) or destination.startswith("-"):
         raise ValueError("host must look like user@hostname")
@@ -411,31 +663,31 @@ def collect_remote(
             raise ValueError(f"not a username: {user}")
         if user not in users:
             users.append(user)
-    command = [
-        "ssh",
+    options = [
         "-o",
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=8",
         "-o",
         "StrictHostKeyChecking=accept-new" if accept_new else "StrictHostKeyChecking=yes",
-        destination,
-        "sh",
-        "-s",
-        "--",
-        *users,
     ]
     if port is not None:
         if not isinstance(port, int) or not 1 <= port <= 65535:
             raise ValueError("port is out of range")
-        command[1:1] = ["-p", str(port)]
+        options[0:0] = ["-p", str(port)]
+    if identity_file is not None:
+        if not identity_file or identity_file.startswith("-") or "\n" in identity_file:
+            raise ValueError("identity file path is not usable")
+        # The path is handed to ssh. Keywarden never opens it.
+        options.extend(["-i", os.path.expanduser(identity_file), "-o", "IdentitiesOnly=yes"])
+    command = ["ssh", *options, "--", destination, "sh", "-s", "--", *users]
     try:
         completed = subprocess.run(
             command,
             input=REMOTE_SCRIPT,
             capture_output=True,
             text=True,
-            timeout=40,
+            timeout=60,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
@@ -449,8 +701,11 @@ def collect_remote(
                 tail = line.strip()[:180]
                 break
         raise RuntimeError(tail or f"ssh exited {completed.returncode}")
-    host = parse_protocol(completed.stdout, address=destination)
-    return host
+    output = completed.stdout
+    try:
+        return parse_protocol(output, address=destination)
+    finally:
+        del output
 
 
 def read_observation(path: str) -> str:

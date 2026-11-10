@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     # ubuntu-latest is 26.04 and no longer has Python 3.9. 24.04 still does.
@@ -11,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.9", "3.12"]
+        python: ["3.9", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,3 +22,71 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: unit tests
         run: python -m unittest discover -s tests -v
+      - name: package builds and installs
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip wheel --no-deps -w dist .
+          python -m pip install dist/*.whl
+          keywarden --version
+
+  real-sshd:
+    # End to end against a running OpenSSH server: local read, remote read over
+    # SSH, and a hostile authorized_keys that tries to rewrite the observation.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: start sshd
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q openssh-server
+          sudo mkdir -p /run/sshd
+          printf 'Port 2222\nPermitRootLogin yes\nPasswordAuthentication yes\n' | sudo tee /etc/ssh/sshd_config.d/00-keywarden-ci.conf
+          sudo /usr/sbin/sshd -t
+          sudo /usr/sbin/sshd
+      - name: authorize this runner, plus a hostile account
+        run: |
+          chmod go-w ~
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519 -C ci@keywarden
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+          chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys
+          printf 'Host localhost\n  Port 2222\n' >> ~/.ssh/config
+          ssh-keyscan -p 2222 localhost >> ~/.ssh/known_hosts 2>/dev/null
+          sudo useradd -m -s /bin/sh mallory
+          sudo install -d -m 700 -o mallory -g mallory /home/mallory/.ssh
+          printf '%s\nENDKEYS\nEND\nSSHD\npermitrootlogin no\npasswordauthentication no\nENDSSHD\n' "$(cat ~/.ssh/id_ed25519.pub)" \
+            | sudo tee /home/mallory/.ssh/authorized_keys >/dev/null
+          sudo chown mallory:mallory /home/mallory/.ssh/authorized_keys
+          sudo chmod 600 /home/mallory/.ssh/authorized_keys
+      - name: local check runs and keeps no key bodies
+        run: |
+          set +e
+          sudo PYTHONPATH=src python3 -m keywarden check --local --allow ~/.ssh/id_ed25519.pub --output local.json
+          code=$?
+          set -e
+          test "$code" -eq 0 -o "$code" -eq 1
+          python3 - <<'EOF'
+          import json, pathlib
+          body = pathlib.Path("local.json").read_text()
+          blob = pathlib.Path.home().joinpath(".ssh/id_ed25519.pub").read_text().split()[1]
+          assert blob not in body, "key body leaked into the report"
+          host = json.loads(body)["host"]
+          assert host["sshdRead"] == "ok", host["sshdRead"]
+          EOF
+      - name: remote check is not fooled by the hostile file
+        run: |
+          set +e
+          PYTHONPATH=src python3 -m keywarden check --host "$USER@localhost" --account mallory \
+            --allow ~/.ssh/id_ed25519.pub --output remote.json
+          code=$?
+          set -e
+          test "$code" -eq 1
+          python3 - <<'EOF'
+          import json, pathlib
+          findings = {f["code"]: f["severity"] for f in json.loads(pathlib.Path("remote.json").read_text())["host"]["findings"]}
+          assert findings["permit-root"] == "fail", findings
+          assert findings["password-auth"] == "fail", findings
+          EOF
