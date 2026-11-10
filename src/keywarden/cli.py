@@ -3,20 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
-import re
 import sys
 from pathlib import Path
 
 from keywarden import __version__
-from keywarden.check import Policy, apply_drift, evaluate, worst
-from keywarden.collect import collect_local, collect_remote, now_iso, parse_protocol, read_observation
+from keywarden.check import FINGERPRINT, HostObservation, Policy, PriorFindings, apply_drift, evaluate, worst
+from keywarden.collect import ProtocolError, collect_local, collect_remote, now_iso, parse_protocol, read_observation
 from keywarden.inventory import parse_inventory
 from keywarden.parse import PrivateKeyError, parse_public_keys
 
 MAX_INPUT_BYTES = 1_000_000
 MAX_INVENTORY_HOSTS = 256
-_FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]+")
+_FINGERPRINT = FINGERPRINT
 
 
 def _load_allow(path: Path | None):
@@ -34,7 +34,7 @@ def _load_allow(path: Path | None):
     return keys
 
 
-def _load_prior(path: Path | None, hostname: str):
+def _load_prior(path: Path | None, hostname: str) -> PriorFindings | None:
     if path is None:
         return None
     document = json.loads(path.read_text(encoding="utf-8"))
@@ -46,8 +46,23 @@ def _load_prior(path: Path | None, hostname: str):
     if name and name != hostname:
         print(f"prior report is for {name}, not {hostname}; drift skipped", file=sys.stderr)
         return None
-    findings = host.get("findings") or []
-    return {item["code"]: item["severity"] for item in findings if isinstance(item, dict) and "code" in item}
+    prior: PriorFindings = {}
+    for item in host.get("findings") or []:
+        if not isinstance(item, dict) or "code" not in item:
+            continue
+        prints = item.get("fingerprints")
+        if not isinstance(prints, list):
+            # Reports from 0.1.0 have no fingerprints array; read them from the detail.
+            prints = _FINGERPRINT.findall(str(item.get("detail") or ""))
+        prior[item["code"]] = (str(item.get("severity")), {str(value) for value in prints})
+    return prior
+
+
+def _redact(host: HostObservation, push: list) -> list:
+    """Drop key comments. They are often an email address or a laptop name."""
+    for account in host.accounts:
+        account.keys = [dataclasses.replace(key, comment="") for key in account.keys]
+    return [dataclasses.replace(key, comment="") for key in push]
 
 
 def _report(host, push, findings) -> dict:
@@ -63,6 +78,9 @@ def _report(host, push, findings) -> dict:
             "address": host.address,
             "role": host.role,
             "observedAt": host.observed_at,
+            "privilege": host.privilege,
+            "sshdRead": host.sshd_state,
+            "matchBlocks": host.match_blocks,
             "posture": worst(findings),
             "sshd": host.sshd.as_dict(),
             "findings": [item.as_dict() for item in findings],
@@ -77,6 +95,8 @@ def _print_human(document: dict) -> None:
         drift = f"  {item['drift']}" if item.get("drift") else ""
         print(f"  {item['severity'].upper():4}  {item['code']}{drift}  {item['title']}")
         print(f"        {item['detail']}")
+        if item.get("newFingerprints"):
+            print(f"        new since the prior report: {' '.join(item['newFingerprints'])}")
     print("key material omitted")
 
 
@@ -124,6 +144,8 @@ def _check_one(args: argparse.Namespace) -> int:
             host = parse_protocol(raw, address=address)
         finally:
             del raw
+    if args.redact_comments:
+        push = _redact(host, push)
     policy = _policy(args)
     findings = apply_drift(evaluate(host, push, policy), _load_prior(args.prior, host.name))
     document = _report(host, push, findings)
@@ -137,7 +159,8 @@ def _check_one(args: argparse.Namespace) -> int:
     return 1 if host_failed(document) else 0
 
 
-def _unreachable(name: str, address: str, detail: str) -> dict:
+def _unreachable(name: str, address: str, detail: str, code: str = "unreachable") -> dict:
+    title = "Host could not be checked" if code == "unreachable" else "Collector output was refused"
     return {
         "name": name,
         "address": address,
@@ -147,9 +170,9 @@ def _unreachable(name: str, address: str, detail: str) -> dict:
         "sshd": {},
         "findings": [
             {
-                "code": "unreachable",
+                "code": code,
                 "severity": "fail",
-                "title": "Host could not be checked",
+                "title": title,
                 "detail": detail[:180],
             }
         ],
@@ -160,13 +183,15 @@ def _check_inventory(args: argparse.Namespace) -> int:
     if args.prior:
         raise ValueError("--prior applies to one host; leave it off with --inventory")
     push = _load_allow(args.allow)
+    if args.redact_comments:
+        push = [dataclasses.replace(key, comment="") for key in push]
     text = args.inventory.read_text(encoding="utf-8", errors="replace")
     try:
         if len(text.encode("utf-8", errors="replace")) > MAX_INPUT_BYTES:
             raise ValueError("inventory is larger than 1 MB")
         if "PRIVATE KEY" in text or "-----BEGIN" in text or "PuTTY-User-Key-File" in text:
             raise PrivateKeyError("private key material was present and was not recorded")
-        targets = parse_inventory(text)
+        targets = parse_inventory(text, source=args.inventory.name)
     finally:
         del text
     if not targets:
@@ -179,7 +204,17 @@ def _check_inventory(args: argparse.Namespace) -> int:
     plain: list[str] = []
     for target in targets:
         try:
-            observed = collect_remote(target.destination, args.account, target.port, accept_new=args.accept_new)
+            observed = collect_remote(
+                target.destination,
+                args.account,
+                target.port,
+                accept_new=args.accept_new,
+                identity_file=target.identity_file,
+            )
+        except ProtocolError as exc:
+            host_reports.append(_unreachable(target.name, target.destination, str(exc), code="collector-output"))
+            plain.append(f"{target.name}  collector-output")
+            continue
         except (OSError, RuntimeError, ValueError) as exc:
             report = _unreachable(target.name, target.destination, str(exc))
             host_reports.append(report)
@@ -187,6 +222,8 @@ def _check_inventory(args: argparse.Namespace) -> int:
             continue
         observed.name = target.name
         observed.address = target.destination
+        if args.redact_comments:
+            _redact(observed, [])
         findings = evaluate(observed, push, policy)
         host_reports.append(_report(observed, push, findings)["host"])
         _remember_failure(found, plain, target.name, host_reports[-1]["findings"])
@@ -240,6 +277,11 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--json", action="store_true", help="print the JSON report")
     check.add_argument("--no-outside", action="store_true", help="do not flag keys missing from --allow")
     check.add_argument("--no-weak", action="store_true", help="do not flag DSA or RSA under 3072 bits")
+    check.add_argument(
+        "--redact-comments",
+        action="store_true",
+        help="leave key comments (often an email or machine name) out of the output",
+    )
     check.add_argument(
         "--accept-new",
         action="store_true",

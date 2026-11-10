@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from keywarden.parse import KeyRef
 
 WEAK_RSA_BITS = 3072
+FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]+")
+_RANK = {"pass": 0, "warn": 1, "fail": 2}
 
 
 @dataclass
@@ -64,6 +67,10 @@ class HostObservation:
     sshd: SshdFacts
     accounts: list[Account]
     passwd_state: str = "unknown"
+    sshd_state: str = "unknown"  # ok, failed, missing, unknown (hand-made observation)
+    match_blocks: str = "unknown"  # yes, no, unknown
+    sshd_root: SshdFacts | None = None  # sshd -T -C user=root, when Match blocks exist
+    privilege: str = "unknown"  # root, sudo, none
 
 
 @dataclass
@@ -73,6 +80,11 @@ class Finding:
     title: str
     detail: str
     drift: str | None = None
+    new_fingerprints: list[str] = field(default_factory=list)
+
+    @property
+    def fingerprints(self) -> list[str]:
+        return list(dict.fromkeys(FINGERPRINT.findall(self.detail or "")))
 
     def as_dict(self) -> dict:
         data = {
@@ -81,8 +93,13 @@ class Finding:
             "title": self.title,
             "detail": self.detail,
         }
+        prints = self.fingerprints
+        if prints:
+            data["fingerprints"] = prints
         if self.drift:
             data["drift"] = self.drift
+        if self.new_fingerprints:
+            data["newFingerprints"] = list(self.new_fingerprints)
         return data
 
 
@@ -157,6 +174,12 @@ def _describe(keys: list[KeyRef]) -> str:
     return "; ".join(parts)
 
 
+def _names(accounts: list[Account], limit: int = 10) -> str:
+    names = [account.user for account in accounts]
+    shown = ", ".join(names[:limit])
+    return shown + (f", and {len(names) - limit} more" if len(names) > limit else "")
+
+
 def _unique_count(keys: list[KeyRef]) -> int:
     return len({key.fingerprint for key in keys})
 
@@ -197,95 +220,114 @@ def _with_user(key: KeyRef, user: str) -> KeyRef:
     return KeyRef(key.fingerprint, key.type, key.kind, key.bits, key.comment, user, key.cert_authority, key.cert)
 
 
+def _permit_root(value: str, raw: str) -> Finding | None:
+    if value == "no":
+        return Finding("permit-root", "pass", "Root login is disabled", "PermitRootLogin is no. Named accounts must log in, then escalate.")
+    if value in {"prohibit-password", "without-password"}:
+        return Finding(
+            "permit-root",
+            "fail",
+            "Root can still log in with a key",
+            f"PermitRootLogin is {raw}. Password is blocked, but a root public key still opens a root shell. Set it to no.",
+        )
+    if value == "forced-commands-only":
+        return Finding(
+            "permit-root",
+            "warn",
+            "Root login is forced-commands-only",
+            "Root SSH is limited to a command pinned on the key. Confirm that command is the only one you intend.",
+        )
+    if value in {"unknown", ""}:
+        return Finding("permit-root", "warn", "PermitRootLogin was not in the observation", "sshd -T did not include PermitRootLogin.")
+    return Finding("permit-root", "fail", "Root login is enabled", f"PermitRootLogin is {raw}. Set it to no.")
+
+
+def _password_auth(value: str, raw: str) -> Finding | None:
+    if value == "no":
+        return Finding("password-auth", "pass", "Password authentication is off", "PasswordAuthentication is no.")
+    if value in {"unknown", ""}:
+        return Finding("password-auth", "warn", "Password authentication was not observed", "sshd -T did not include PasswordAuthentication.")
+    return Finding(
+        "password-auth",
+        "fail",
+        "Password authentication is on",
+        f"PasswordAuthentication is {raw}. Keys do not help if a password still works.",
+    )
+
+
+def _kbd_interactive(value: str, raw: str) -> Finding | None:
+    if value == "yes":
+        return Finding(
+            "keyboard-interactive",
+            "fail",
+            "Keyboard-interactive authentication is on",
+            "KbdInteractiveAuthentication yes is another password path. Turn it off.",
+        )
+    if value == "no":
+        return Finding("keyboard-interactive", "pass", "Keyboard-interactive authentication is off", "KbdInteractiveAuthentication is no.")
+    return None
+
+
+def _with_root_match(host: HostObservation, attr: str, rule, daemon_unread: bool) -> Finding | None:
+    """Evaluate a daemon setting, then let a Match block for root make it worse, never better."""
+    raw = getattr(host.sshd, attr)
+    value = raw.lower()
+    if daemon_unread and value in {"unknown", ""}:
+        return None
+    base = rule(value, raw)
+    if host.sshd_root is None:
+        return base
+    root_raw = getattr(host.sshd_root, attr)
+    root_value = root_raw.lower()
+    if root_value in {"unknown", ""} or root_value == value:
+        return base
+    for_root = rule(root_value, root_raw)
+    if for_root is None or (base is not None and _RANK[for_root.severity] <= _RANK[base.severity]):
+        return base
+    return Finding(
+        for_root.code,
+        for_root.severity,
+        for_root.title + " (Match block for root)",
+        f"A Match block changes this for root. Default: {raw}. For root: {root_raw}. " + for_root.detail,
+    )
+
+
 def evaluate(host: HostObservation, push: list[KeyRef], policy: Policy) -> list[Finding]:
     findings: list[Finding] = []
-    root = host.sshd.permit_root_login.lower()
-
-    if root == "no":
-        findings.append(
-            Finding(
-                "permit-root",
-                "pass",
-                "Root login is disabled",
-                "PermitRootLogin is no. Named accounts must log in, then escalate.",
-            )
+    daemon_unread = host.sshd_state in {"failed", "missing"}
+    if daemon_unread:
+        reason = (
+            "sshd was not found on PATH or in /usr/sbin, /usr/local/sbin, or /sbin."
+            if host.sshd_state == "missing"
+            else "sshd -T exited with an error. It usually needs root, or passwordless sudo, to read the host keys."
         )
-    elif root in {"prohibit-password", "without-password"}:
         findings.append(
             Finding(
-                "permit-root",
-                "fail",
-                "Root can still log in with a key",
-                f"PermitRootLogin is {host.sshd.permit_root_login}. Password is blocked, but a root public key still opens a root shell. Set it to no.",
-            )
-        )
-    elif root == "forced-commands-only":
-        findings.append(
-            Finding(
-                "permit-root",
+                "sshd-config",
                 "warn",
-                "Root login is forced-commands-only",
-                "Root SSH is limited to a command pinned on the key. Confirm that command is the only one you intend.",
-            )
-        )
-    elif root in {"unknown", ""}:
-        findings.append(
-            Finding(
-                "permit-root",
-                "warn",
-                "PermitRootLogin was not in the observation",
-                "sshd -T did not include PermitRootLogin.",
-            )
-        )
-    else:
-        findings.append(
-            Finding(
-                "permit-root",
-                "fail",
-                "Root login is enabled",
-                f"PermitRootLogin is {host.sshd.permit_root_login}. Set it to no.",
+                "The effective sshd configuration could not be read",
+                reason + " Daemon checks were skipped, not passed.",
             )
         )
 
-    password = host.sshd.password_authentication.lower()
-    if password == "no":
-        findings.append(Finding("password-auth", "pass", "Password authentication is off", "PasswordAuthentication is no."))
-    elif password == "unknown":
-        findings.append(
-            Finding(
-                "password-auth",
-                "warn",
-                "Password authentication was not observed",
-                "sshd -T did not include PasswordAuthentication.",
-            )
-        )
-    else:
-        findings.append(
-            Finding(
-                "password-auth",
-                "fail",
-                "Password authentication is on",
-                "PasswordAuthentication is yes. Keys do not help if a password still works.",
-            )
-        )
+    for finding in (
+        _with_root_match(host, "permit_root_login", _permit_root, daemon_unread),
+        _with_root_match(host, "password_authentication", _password_auth, daemon_unread),
+        _with_root_match(host, "kbd_interactive_authentication", _kbd_interactive, daemon_unread),
+    ):
+        if finding is not None:
+            findings.append(finding)
 
-    kbd = host.sshd.kbd_interactive_authentication.lower()
-    if kbd == "yes":
+    if host.match_blocks == "yes":
+        evaluated = "Root was evaluated with its own Match context. " if host.sshd_root is not None else ""
         findings.append(
             Finding(
-                "keyboard-interactive",
-                "fail",
-                "Keyboard-interactive authentication is on",
-                "KbdInteractiveAuthentication yes is another password path. Turn it off.",
-            )
-        )
-    elif kbd == "no":
-        findings.append(
-            Finding(
-                "keyboard-interactive",
-                "pass",
-                "Keyboard-interactive authentication is off",
-                "KbdInteractiveAuthentication is no.",
+                "match-blocks",
+                "warn",
+                "sshd_config has Match blocks",
+                "The daemon checks use the default settings. "
+                + evaluated
+                + "Match blocks for other users, groups, or addresses can override them and were not evaluated.",
             )
         )
 
@@ -341,7 +383,9 @@ def evaluate(host: HostObservation, push: list[KeyRef], policy: Policy) -> list[
     loose = []
     unseen = []
     for account in host.accounts:
-        if account.read_state == "unreadable":
+        if account.read_state == "unreadable" or (
+            account.read_state == "ok" and "unknown" in {account.dir_mode, account.file_mode}
+        ):
             unseen.append(account)
             continue
         dir_open = _mode_too_open(account.dir_mode)
@@ -357,7 +401,7 @@ def evaluate(host: HostObservation, push: list[KeyRef], policy: Policy) -> list[
                 "permissions",
                 "warn",
                 "Some SSH files could not be read",
-                "Modes were checked only where authorized_keys was readable.",
+                "Modes were checked only where they were visible. Not checked: " + _names(unseen) + ".",
             )
         )
     else:
@@ -565,18 +609,34 @@ def worst(findings: list[Finding]) -> str:
     return "pass"
 
 
-def apply_drift(findings: list[Finding], prior: dict[str, str] | None) -> list[Finding]:
+PriorFindings = dict[str, tuple[str, set[str]]]
+
+
+def apply_drift(findings: list[Finding], prior: PriorFindings | None) -> list[Finding]:
+    """Mark changes against an earlier report.
+
+    regressed: was pass, now fail. new: no earlier result, now fail.
+    new-keys: was already failing, and now names a fingerprint it did not name before.
+    cleared: was fail, now pass.
+    """
     if not prior:
         return findings
     adjusted: list[Finding] = []
     for item in findings:
         before = prior.get(item.code)
         drift = None
+        added: list[str] = []
         if before is None:
             drift = "new" if item.severity == "fail" else None
-        elif before == "pass" and item.severity == "fail":
-            drift = "regressed"
-        elif before == "fail" and item.severity == "pass":
-            drift = "cleared"
-        adjusted.append(Finding(item.code, item.severity, item.title, item.detail, drift))
+        else:
+            severity, prints = before
+            if severity == "pass" and item.severity == "fail":
+                drift = "regressed"
+            elif severity == "fail" and item.severity == "pass":
+                drift = "cleared"
+            elif severity == "fail" and item.severity == "fail":
+                added = [fingerprint for fingerprint in item.fingerprints if fingerprint not in prints]
+                if added:
+                    drift = "new-keys"
+        adjusted.append(Finding(item.code, item.severity, item.title, item.detail, drift, added))
     return adjusted
