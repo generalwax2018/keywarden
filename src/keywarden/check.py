@@ -132,13 +132,30 @@ def _mode_too_open(mode: str) -> bool | None:
 
 
 def _describe(keys: list[KeyRef]) -> str:
-    parts = []
+    grouped: dict[str, list[KeyRef]] = {}
+    order: list[str] = []
     for key in keys:
-        who = key.comment or "no comment"
-        where = f"{key.user} · " if key.user else ""
+        if key.fingerprint not in grouped:
+            grouped[key.fingerprint] = []
+            order.append(key.fingerprint)
+        grouped[key.fingerprint].append(key)
+    parts = []
+    for fingerprint in order:
+        items = grouped[fingerprint]
+        key = items[0]
+        users: list[str] = []
+        for item in items:
+            if item.user and item.user not in users:
+                users.append(item.user)
+        where = f"{', '.join(users)} · " if users else ""
         bits = f" {key.bits}-bit" if key.bits else ""
-        parts.append(f"{where}{key.type}{bits} {key.fingerprint} ({who})")
+        who = key.comment or "no comment"
+        parts.append(f"{where}{key.type}{bits} {fingerprint} ({who})")
     return "; ".join(parts)
+
+
+def _unique_count(keys: list[KeyRef]) -> int:
+    return len({key.fingerprint for key in keys})
 
 
 def _with_user(key: KeyRef, user: str) -> KeyRef:
@@ -283,7 +300,7 @@ def evaluate(host: HostObservation, push: list[KeyRef], policy: Policy) -> list[
                 )
             )
         else:
-            title = "A key is authorized for root" if len(root_keys) == 1 else f"{len(root_keys)} keys are authorized for root"
+            title = "A key is authorized for root" if _unique_count(root_keys) == 1 else f"{_unique_count(root_keys)} keys are authorized for root"
             findings.append(Finding("root-authorized-key", "fail", title, _describe(root_keys)))
 
     loose = []
@@ -336,7 +353,7 @@ def evaluate(host: HostObservation, push: list[KeyRef], policy: Policy) -> list[
                 )
             )
         else:
-            title = "A weak public key is authorized" if len(weak) == 1 else f"{len(weak)} weak public keys are authorized"
+            title = "A weak public key is authorized" if _unique_count(weak) == 1 else f"{_unique_count(weak)} weak public keys are authorized"
             findings.append(Finding("weak-algorithm", "fail", title, _describe(weak)))
 
     push_set = {key.fingerprint for key in push}
@@ -367,7 +384,7 @@ def evaluate(host: HostObservation, push: list[KeyRef], policy: Policy) -> list[
                 )
             )
         else:
-            title = "A key is not in the push" if len(outside) == 1 else f"{len(outside)} keys are not in the push"
+            title = "A key is not in the push" if _unique_count(outside) == 1 else f"{_unique_count(outside)} keys are not in the push"
             findings.append(Finding("outside-push", "fail", title, _describe(outside)))
 
     all_keys = [_with_user(key, account.user) for account in host.accounts for key in account.keys]
@@ -382,7 +399,7 @@ def evaluate(host: HostObservation, push: list[KeyRef], policy: Policy) -> list[
             )
         )
     else:
-        title = "A line trusts a certificate authority" if len(authorities) == 1 else f"{len(authorities)} lines trust a certificate authority"
+        title = "A line trusts a certificate authority" if _unique_count(authorities) == 1 else f"{_unique_count(authorities)} lines trust a certificate authority"
         findings.append(
             Finding(
                 "cert-authority",
@@ -393,19 +410,27 @@ def evaluate(host: HostObservation, push: list[KeyRef], policy: Policy) -> list[
         )
 
     now = int(time.time())
-    problems = []
+    by_fingerprint: dict[str, list[KeyRef]] = {}
     for key in all_keys:
-        cert = key.cert
-        if not cert:
+        if not key.cert:
             continue
-        who = f"{key.user + ' · ' if key.user else ''}{key.fingerprint}"
-        if cert.unreadable:
+        by_fingerprint.setdefault(key.fingerprint, []).append(key)
+    problems = []
+    for fingerprint, items in by_fingerprint.items():
+        key = items[0]
+        cert = key.cert
+        users: list[str] = []
+        for item in items:
+            if item.user and item.user not in users:
+                users.append(item.user)
+        who = f"{', '.join(users)} · {fingerprint}" if users else fingerprint
+        if cert and cert.unreadable:
             problems.append(f"{who} could not be read")
-        elif cert.cert_type == "host":
+        elif cert and cert.cert_type == "host":
             problems.append(f"{who} is a host certificate")
-        elif cert.valid_after > now:
+        elif cert and cert.valid_after > now:
             problems.append(f"{who} is not valid yet")
-        elif cert.valid_before is not None and cert.valid_before < now:
+        elif cert and cert.valid_before is not None and cert.valid_before < now:
             problems.append(f"{who} has expired")
     if problems:
         title = "An SSH certificate is not acceptable" if len(problems) == 1 else f"{len(problems)} SSH certificates are not acceptable"

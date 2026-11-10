@@ -239,8 +239,9 @@ class InventoryTests(unittest.TestCase):
         fingerprint = parse_public_keys(ROOT_KEY)[0][0].fingerprint
 
         def fake(destination, extra_users=None, port=None):
-            if "app-web-03" in destination:
-                return parse_protocol(bad, address=destination)
+            if "app-web-0" in destination:
+                name = "app-web-04" if "04" in destination else "app-web-03"
+                return parse_protocol(bad.replace("HOST app-web-03", f"HOST {name}"), address=destination)
             if "down" in destination:
                 raise RuntimeError("ssh timed out before a check could finish")
             return parse_protocol(good, address=destination)
@@ -249,7 +250,14 @@ class InventoryTests(unittest.TestCase):
             folder = Path(tmp)
             inventory = folder / "hosts.ini"
             inventory.write_text(
-                "bastion-01 ansible_user=deploy\napp-web-03 ansible_user=deploy\ndown-01 ansible_user=deploy\n",
+                "\n".join(
+                    [
+                        "bastion-01 ansible_user=deploy",
+                        "app-web-03 ansible_user=deploy",
+                        "app-web-04 ansible_user=deploy",
+                        "down-01 ansible_user=deploy",
+                    ]
+                ),
                 encoding="utf-8",
             )
             allow = folder / "team.pub"
@@ -268,12 +276,37 @@ class InventoryTests(unittest.TestCase):
             self.assertNotIn(ROOT_KEY.split()[1], written)
             self.assertIn(fingerprint, written)
             self.assertEqual(json.loads(written)["posture"], "fail")
-            self.assertEqual(len(json.loads(written)["hosts"]), 3)
-            self.assertIn(f"app-web-03  permit-root", printed)
-            self.assertIn(f"app-web-03  outside-push  {fingerprint}", printed)
+            self.assertEqual(len(json.loads(written)["hosts"]), 4)
+            self.assertEqual(json.loads(written)["fingerprints"], [fingerprint])
+            self.assertEqual(printed.count(fingerprint), 1)
+            self.assertIn(f"{fingerprint}  outside-push  app-web-03 app-web-04", printed)
+            self.assertIn("app-web-03  permit-root", printed)
             self.assertIn("down-01  unreachable", printed)
             self.assertNotIn("bastion-01", printed)
             self.assertNotIn("PASS", printed)
+
+    def test_one_fingerprint_on_two_accounts_is_listed_once(self):
+        from keywarden.check import Account, HostObservation, Policy, SshdFacts, evaluate
+        from keywarden.parse import parse_public_keys
+
+        keys, _ = parse_public_keys(ROOT_KEY)
+        allow, _ = parse_public_keys(OPS)
+        host = HostObservation(
+            "web",
+            "x",
+            "observed",
+            "t",
+            SshdFacts("no", "no", "no", "yes", "no"),
+            [
+                Account("ops", "700", "600", keys, "ok"),
+                Account("deploy", "700", "600", keys, "ok"),
+            ],
+        )
+        findings = evaluate(host, allow, Policy())
+        outside = next(item for item in findings if item.code == "outside-push")
+        self.assertEqual(outside.detail.count(keys[0].fingerprint), 1)
+        self.assertIn("ops, deploy", outside.detail)
+        self.assertIn("A key is not in the push", outside.title)
 
 
 class CertificateTests(unittest.TestCase):

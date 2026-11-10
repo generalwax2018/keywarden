@@ -58,7 +58,7 @@ keywarden check --inventory hosts.ini --allow team.pub
 
 `hosts.ini` is the INI inventory you already use. Keywarden reads `ansible_user`, `ansible_host`, and `ansible_port`. It ignores passwords, become passwords, and private-key paths in that file. Each host is one SSH, in order. A host that cannot be reached is a failure, and the rest are still checked.
 
-The terminal shows failures only: hostname, check, and fingerprint when the check is about a key. Passes are not printed. Exit 1 if any host failed. `--output` writes the JSON report, still without key bodies. `--prior` is for one host, not an inventory.
+The terminal shows failures only. A check that names a key is printed once per fingerprint, with every host where that fingerprint failed. Other failures stay on their own line: hostname and check. Passes are not printed. Exit 1 if any host failed. `--output` writes the JSON report, still without key bodies. The `fingerprints` array is the unique set. `--prior` is for one host, not an inventory.
 
 ```ini
 [web]

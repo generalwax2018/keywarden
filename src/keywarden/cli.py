@@ -80,14 +80,29 @@ def _print_human(document: dict) -> None:
     print("key material omitted")
 
 
-def _failure_rows(name: str, findings: list[dict]) -> list[str]:
-    rows = []
+def _remember_failure(found: dict[str, dict[str, list[str]]], plain: list[str], name: str, findings: list[dict]) -> None:
     for item in findings:
         if item.get("severity") != "fail":
             continue
-        found = " ".join(_FINGERPRINT.findall(item.get("detail") or ""))
-        rows.append(f"{name}  {item['code']}" + (f"  {found}" if found else ""))
-    return rows
+        fingerprints = list(dict.fromkeys(_FINGERPRINT.findall(item.get("detail") or "")))
+        if not fingerprints:
+            plain.append(f"{name}  {item['code']}")
+            continue
+        for fingerprint in fingerprints:
+            bucket = found.setdefault(fingerprint, {"codes": [], "hosts": []})
+            if item["code"] not in bucket["codes"]:
+                bucket["codes"].append(item["code"])
+            if name not in bucket["hosts"]:
+                bucket["hosts"].append(name)
+
+
+def _unique_failure_lines(found: dict[str, dict[str, list[str]]], plain: list[str]) -> list[str]:
+    lines = [
+        f"{fingerprint}  {' '.join(info['codes'])}  {' '.join(info['hosts'])}"
+        for fingerprint, info in found.items()
+    ]
+    lines.extend(plain)
+    return lines
 
 
 def _policy(args: argparse.Namespace) -> Policy:
@@ -160,21 +175,23 @@ def _check_inventory(args: argparse.Namespace) -> int:
         raise ValueError(f"inventory has more than {MAX_INVENTORY_HOSTS} hosts")
     policy = _policy(args)
     host_reports = []
-    rows: list[str] = []
+    found: dict[str, dict[str, list[str]]] = {}
+    plain: list[str] = []
     for target in targets:
         try:
             observed = collect_remote(target.destination, args.account, target.port)
         except (OSError, RuntimeError, ValueError) as exc:
             report = _unreachable(target.name, target.destination, str(exc))
             host_reports.append(report)
-            rows.append(f"{target.name}  unreachable")
+            plain.append(f"{target.name}  unreachable")
             continue
         observed.name = target.name
         observed.address = target.destination
         findings = evaluate(observed, push, policy)
         host_reports.append(_report(observed, push, findings)["host"])
-        rows.extend(_failure_rows(target.name, host_reports[-1]["findings"]))
+        _remember_failure(found, plain, target.name, host_reports[-1]["findings"])
     posture = "fail" if any(item["posture"] == "fail" for item in host_reports) else "pass"
+    rows = _unique_failure_lines(found, plain)
     document = {
         "product": "keywarden",
         "version": __version__,
@@ -182,6 +199,7 @@ def _check_inventory(args: argparse.Namespace) -> int:
         "note": "Public key bodies are not included. Fingerprints identify keys.",
         "generatedAt": now_iso(),
         "push": [key.public() for key in push],
+        "fingerprints": list(found),
         "posture": posture,
         "hosts": host_reports,
     }
