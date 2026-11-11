@@ -11,6 +11,7 @@ Access review: who each key lets in, as what, from where, and whether anyone sti
 - Access review table in the JSON report (`keys`), on the terminal (`--keys`), and as CSV (`--csv`), with spreadsheet formula injection blocked.
 - Waivers (`--waivers`, JSON or TOML): accepted risks with a reason, an owner or ticket, and a required end date. Waived findings are `accepted`; expired and unused waivers are reported.
 - `--redact-addresses` drops the last login address.
+- `keywarden ui`: the checks in a browser tab served from this machine only (127.0.0.1, one-time token, no external requests, no key storage), with a lab of six made-up hosts, the access review table, find a key, and JSON/CSV export.
 - Collector protocol 3. Output from the 0.1.1 collector (protocol 2) is still read; it has no sudo or login data, so those checks are skipped.
 
 ## 0.1.1 — 2026-11-10

@@ -24,6 +24,16 @@ cd keywarden
 PYTHONPATH=src python3 -m keywarden --version
 ```
 
+## Use it in a browser
+
+```sh
+keywarden ui
+```
+
+This opens Keywarden in a browser tab, served from your machine. Paste the public keys you push, choose what to check (this machine, one host, an Ansible inventory, or collector output you paste), and run. Results show failing hosts first, with the access review table and a "find a key" search beside them. Export the findings as JSON or the key table as CSV. Press **Fill lab keys** and **Run checks** to try it on six made-up hosts first.
+
+The server listens on `127.0.0.1` only, on a random port, and the link it prints carries a one-time token. It refuses requests without that token, from another web page, or with a Host header other than localhost, so a site you visit cannot drive it. The page loads nothing from the internet. Key text is fingerprinted on arrival and cleared from the box; the tab holds fingerprints only, and nothing is written to disk unless you export. Use `--port` to pick the port and `--no-browser` to print the link without opening it.
+
 ## Check this machine
 
 ```sh

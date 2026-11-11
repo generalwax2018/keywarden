@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import dataclasses
+import io
 import json
 import sys
 from datetime import date
@@ -61,8 +62,11 @@ def _load_allow(path: Path | None):
 def _load_prior(path: Path | None, hostname: str) -> PriorFindings | None:
     if path is None:
         return None
-    document = json.loads(path.read_text(encoding="utf-8"))
-    host = document.get("host")
+    return prior_from_document(json.loads(path.read_text(encoding="utf-8")), hostname)
+
+
+def prior_from_document(document, hostname: str) -> PriorFindings | None:
+    host = document.get("host") if isinstance(document, dict) else None
     if not isinstance(host, dict):
         print("prior file has no host report; drift skipped", file=sys.stderr)
         return None
@@ -164,18 +168,25 @@ def _print_keys(rows: list[dict]) -> None:
 
 
 def _write_csv(path: Path, rows: list[dict]) -> None:
+    # Path.write_text has no newline argument before Python 3.10; csv already ends rows with \r\n.
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            options = row["options"]
-            flat = dict(row)
-            flat["from"] = " ".join(options.get("from", []))
-            flat["command"] = "yes" if options.get("command") else ""
-            flat["allows"] = " ".join(options.get("allows", []))
-            flat["inAllow"] = "" if row["inAllow"] is None else ("yes" if row["inAllow"] else "no")
-            flat["certAuthority"] = "yes" if row["certAuthority"] else ""
-            writer.writerow({key: _csv_safe(value) for key, value in flat.items()})
+        handle.write(csv_text(rows))
+
+
+def csv_text(rows: list[dict]) -> str:
+    handle = io.StringIO()
+    writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        options = row["options"]
+        flat = dict(row)
+        flat["from"] = " ".join(options.get("from", []))
+        flat["command"] = "yes" if options.get("command") else ""
+        flat["allows"] = " ".join(options.get("allows", []))
+        flat["inAllow"] = "" if row["inAllow"] is None else ("yes" if row["inAllow"] else "no")
+        flat["certAuthority"] = "yes" if row["certAuthority"] else ""
+        writer.writerow({key: _csv_safe(value) for key, value in flat.items()})
+    return handle.getvalue()
 
 
 def _csv_safe(value):
@@ -538,6 +549,10 @@ def build_parser() -> argparse.ArgumentParser:
     where.add_argument("--key", type=Path, action="append", help="public key file to look for; repeatable")
     where.add_argument("--json", action="store_true", help="print JSON")
     _add_source(where, "Ansible INI inventory; one SSH per host")
+
+    ui = sub.add_parser("ui", help="open the checks in a browser tab served from this machine only")
+    ui.add_argument("--port", type=int, default=0, help="port on 127.0.0.1 (default: any free port)")
+    ui.add_argument("--no-browser", action="store_true", help="print the link instead of opening it")
     return parser
 
 
@@ -545,6 +560,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "ui":
+            from keywarden.ui import serve
+
+            return serve(args.port, open_browser=not args.no_browser)
         if args.command == "where":
             return _where(args)
         if args.inventory:
