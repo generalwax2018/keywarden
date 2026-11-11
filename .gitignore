@@ -6,3 +6,7 @@ dist/
 build/
 keywarden-report.json
 .DS_Store
+
+# Local working files that should never be committed
+Claude outputs/
+*.bundle
