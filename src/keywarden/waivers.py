@@ -106,6 +106,11 @@ def load_waivers(path: Path) -> list[Waiver]:
     return waivers
 
 
+def _sentence(text: str) -> str:
+    text = text.rstrip()
+    return text if text.endswith(".") else text + "."
+
+
 def apply_waivers(findings: list[Finding], host: str, waivers: list[Waiver], today: date, used: set[int]) -> list[Finding]:
     if not waivers:
         return findings
@@ -141,7 +146,7 @@ def apply_waivers(findings: list[Finding], host: str, waivers: list[Waiver], tod
                 item.code,
                 "accepted",
                 item.title,
-                item.detail + " " + " ".join(
+                _sentence(item.detail) + " " + " ".join(
                     [f"Accepted under {waiver.label} until {waiver.expires.isoformat()}: {waiver.reason}" for waiver in active]
                 ),
                 item.drift,
@@ -157,7 +162,7 @@ def apply_waivers(findings: list[Finding], host: str, waivers: list[Waiver], tod
             item.code,
             item.severity,
             item.title,
-            item.detail + (" " + " ".join(notes) if notes else ""),
+            (_sentence(item.detail) + " " + " ".join(notes)) if notes else item.detail,
             item.drift,
             item.new_fingerprints,
         )
