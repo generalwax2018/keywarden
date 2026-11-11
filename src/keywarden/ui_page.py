@@ -175,6 +175,9 @@ details.card .inside { padding: 0 12px 12px; display: grid; gap: 10px; }
 .badge { font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 999px; background: color-mix(in srgb, var(--orange) 18%, transparent); color: var(--orange-text); }
 .badge.acpt { background: color-mix(in srgb, var(--indigo) 16%, transparent); color: var(--indigo-text); }
 .badge.code { background: transparent; color: var(--tertiary); font: 11px var(--mono); padding: 0; }
+.controls { grid-column: 2; display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
+.ctl { font: 10.5px/1.6 var(--mono); padding: 0 6px; border-radius: 6px; background: var(--fill); color: var(--secondary); white-space: nowrap; }
+.ctl b { font-weight: 600; color: var(--label); font-family: var(--font); font-size: 10px; letter-spacing: .02em; margin-right: 3px; }
 .ico { width: 18px; height: 18px; flex: none; margin-top: 1px; filter: drop-shadow(0 1px 2px rgba(0,0,0,.15)); }
 .sev-fail { color: var(--red); } .sev-warn { color: var(--orange); } .sev-pass { color: var(--green); } .sev-accepted { color: var(--indigo); }
 .passes summary { cursor: pointer; padding: 10px 16px; color: var(--blue); font-size: 13px; list-style: none; }
@@ -246,6 +249,7 @@ td.fp, td.mono { font-family: var(--mono); font-size: 12px; }
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>Export
       </button>
       <button class="btn" id="export-csv" type="button" disabled title="Download the access review table as CSV">CSV</button>
+      <button class="btn" id="export-evidence" type="button" disabled title="Download an evidence report (HTML) with CIS, NIST, PCI DSS, and NERC CIP mapping">Evidence</button>
     </div>
   </div>
 </header>
@@ -337,7 +341,7 @@ const TOKEN = "__TOKEN__";
 history.replaceState(null, "", "/");
 
 const $ = (id) => document.getElementById(id);
-const state = { push: [], lab: false, report: null, csv: "", filter: "work", view: "findings", sort: { key: "host", dir: 1 }, onlyRoot: false, onlyStale: false, prior: null, busy: false };
+const state = { push: [], lab: false, report: null, csv: "", evidence: "", filter: "work", view: "findings", sort: { key: "host", dir: 1 }, onlyRoot: false, onlyStale: false, prior: null, busy: false };
 
 // Build elements with text nodes only. Values from hosts never reach innerHTML.
 function h(tag, attrs, ...kids) {
@@ -417,10 +421,10 @@ async function runCheck(target) {
   setBusy(true, target === "inventory" ? " Checking hosts…" : " Checking…");
   try {
     const data = await api("/api/check", body);
-    state.report = data.report; state.csv = data.csv;
+    state.report = data.report; state.csv = data.csv; state.evidence = data.evidence;
     state.push = (data.report.push || []).map((k) => ({ fingerprint: k.fingerprint, type: k.type, bits: k.bits, comment: k.comment }));
     state.lab = data.lab;
-    $("export-json").disabled = false; $("export-csv").disabled = false;
+    $("export-json").disabled = false; $("export-csv").disabled = false; $("export-evidence").disabled = false;
     renderPush(); renderAll(data.notes || []);
   } catch (error) {
     showError(error.message);
@@ -468,8 +472,11 @@ function findingRow(item) {
       item.drift ? h("span", { class: "badge" }, item.drift === "new-keys" ? "New keys" : item.drift.charAt(0).toUpperCase() + item.drift.slice(1)) : "",
       sev === "accepted" ? h("span", { class: "badge acpt" }, "Accepted") : "",
       h("span", { class: "badge code" }, item.code)),
-    h("div", { class: "detail" }, item.detail));
+    h("div", { class: "detail" }, item.detail),
+    (item.controls || []).length && sev !== "pass" ? h("div", { class: "controls", "aria-label": "Related controls" },
+      item.controls.map((c) => h("span", { class: "ctl", title: c.name }, h("b", {}, FRAMEWORK_LABEL[c.framework] || c.framework), c.id))) : "");
 }
+const FRAMEWORK_LABEL = { cis: "CIS", nist: "NIST", pci: "PCI", cip: "CIP" };
 
 function hostCard(host, open) {
   const fails = host.findings.filter((f) => f.severity === "fail").length;
@@ -628,6 +635,7 @@ $("drop").addEventListener("click", () => {
 });
 $("export-json").addEventListener("click", () => state.report && download(`keywarden-${stamp()}.json`, "application/json", JSON.stringify(state.report, null, 2)));
 $("export-csv").addEventListener("click", () => state.csv && download(`keywarden-access-review-${stamp()}.csv`, "text/csv", state.csv));
+$("export-evidence").addEventListener("click", () => state.evidence && download(`keywarden-evidence-${stamp()}.html`, "text/html", state.evidence));
 $("copy-collector").addEventListener("click", async (event) => {
   const button = event.currentTarget;
   try {

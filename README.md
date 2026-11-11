@@ -6,19 +6,22 @@ You keep using whatever already places `authorized_keys` on a machine (Ansible, 
 
 One command checks this machine, one host, or every host in an Ansible inventory. It is a point-in-time check: there is no daemon, scheduler, or stored state.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/findings-dark.webp">
-  <img alt="keywarden ui showing six lab hosts: summary tiles, then app-web-03 with failing root login, root key, and stale key checks" src="docs/screenshots/findings-light.webp">
-</picture>
+![keywarden ui: run checks on six lab hosts, review keys that reach root or have gone stale, and find every place a key still works](https://raw.githubusercontent.com/generalwax2018/keywarden/main/docs/screenshots/demo.gif)
 
-`keywarden ui` on the built-in lab hosts. The same checks run from the command line. [Access review table](docs/screenshots/access-review.webp).
+`keywarden ui` on the built-in lab hosts. Screenshots: [findings, light](https://raw.githubusercontent.com/generalwax2018/keywarden/main/docs/screenshots/findings-light.webp) · [findings, dark](https://raw.githubusercontent.com/generalwax2018/keywarden/main/docs/screenshots/findings-dark.webp) · [access review](https://raw.githubusercontent.com/generalwax2018/keywarden/main/docs/screenshots/access-review.webp).
 
 ## Install
 
 Python 3.9 or newer. No third-party packages. `--local` needs Linux or another POSIX system; the browser UI, `--host`, and `--inventory` also run on Windows using its built-in `ssh`.
 
 ```sh
-python3 -m pip install "git+https://github.com/generalwax2018/keywarden.git@v0.2.0"
+python3 -m pip install keywarden-ssh
+```
+
+Or straight from a tag:
+
+```sh
+python3 -m pip install "git+https://github.com/generalwax2018/keywarden.git@v0.3.0"
 ```
 
 The distribution name is `keywarden-ssh`. The `keywarden` package on PyPI is an unrelated project; do not install it expecting this tool.
@@ -50,6 +53,8 @@ keywarden check --local --allow team.pub
 `team.pub` is the public keys you intend to be authorized, one OpenSSH line each. Keywarden fingerprints them for the comparison and does not copy them into the report.
 
 A failing check exits 1. A clean or warning-only check exits 0. Bad input, including a private key, exits 2 and writes no report.
+
+The terminal shows a summary line, then failures and warnings in colour. Passing checks are counted but hidden; `--verbose` lists them. Colour is off when the output is not a terminal or `NO_COLOR` is set, and `--color always|never` overrides it.
 
 ```sh
 keywarden check --local --allow team.pub --output keywarden-report.json
@@ -165,6 +170,16 @@ Each `sudo -l -U` call is written to the host's auth log by sudo itself.
 **Last used.** Keywarden reads `Accepted publickey for <account> ... SHA256:<fingerprint>` lines. sshd writes these at the default `LogLevel INFO`. It prefers the systemd journal, read only for `ssh.service` and `sshd.service` entries logged as uid 0, which a local user cannot forge. Without a journal it reads `/var/log/auth.log*` or `/var/log/secure*`, including rotated and gzipped files. A local user can write fake lines to those files with `logger`, so the report names which source it used (`authLog`). The log tells you how far back it reaches; a key is only called stale when the logs cover the whole `--stale-days` window. A login through a certificate counts toward the `cert-authority` line that trusted it. A certificate pasted directly into `authorized_keys` is marked `unmatched`, because sshd logs the key inside it rather than the line.
 
 Only the newest login line and a count per account and key leave the host. Pass `--redact-addresses` to drop the last login address from the output.
+
+## Evidence for an assessor
+
+```sh
+keywarden check --inventory hosts.ini --allow team.pub --waivers keywarden.toml --evidence ssh-evidence.html
+```
+
+`--evidence` (or **Evidence** in `keywarden ui`) writes one self-contained HTML file: who ran the check and with what visibility, the hosts in scope, every finding with the controls it bears on, the access review table, accepted risks, and a SHA-256 of the embedded JSON report so an assessor can tell it was not edited. A control coverage table groups the results under CIS Controls v8, NIST SP 800-53 Rev. 5, PCI DSS v4.0, and NERC CIP. Every finding in the JSON report also carries its `controls`.
+
+The mapping is in [docs/compliance.md](docs/compliance.md). It supports an assessment and does not replace one: a passing check is evidence toward a control on the hosts checked, not proof the control is met.
 
 ## Find a key
 

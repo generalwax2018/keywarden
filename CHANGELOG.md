@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 — 2026-11-10
+
+- Compliance mapping: every check maps to CIS Controls v8, NIST SP 800-53 Rev. 5, PCI DSS v4.0, and NERC CIP (CIP-004-7, CIP-005-7, CIP-007-6). Findings in the JSON report carry `controls`; the UI shows them under each finding. See docs/compliance.md.
+- Evidence report: `--evidence report.html` and **Evidence** in `keywarden ui`. Scope, run details, a control coverage table per framework, findings, the access review table, accepted risks, and a SHA-256 of the embedded JSON report.
+- Terminal output: a summary line, colour (off for pipes, `NO_COLOR`, and `--color never`; on in Windows Terminal), and passing checks hidden unless `--verbose`. Inventory runs end with a host count.
+- Published to PyPI as `keywarden-ssh`, from a tag, by a trusted-publishing workflow.
+- README: a demo GIF and screenshots.
+
 ## 0.2.0 — 2026-11-10
 
 Access review: who each key lets in, as what, from where, and whether anyone still uses it.

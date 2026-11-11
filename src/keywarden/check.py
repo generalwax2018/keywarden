@@ -133,6 +133,11 @@ class Finding:
             data["waivers"] = list(self.waivers)
         if self.was:
             data["was"] = self.was
+        from keywarden.controls import controls_for
+
+        controls = controls_for(self.code)
+        if controls:
+            data["controls"] = controls
         return data
 
 

@@ -181,7 +181,15 @@ def run_check(body: dict) -> dict:
         for waiver in waivers
         if waiver.index not in used
     ]
-    return {"report": document, "csv": csv_text(rows), "notes": notes, "lab": body.get("target") == "lab"}
+    from keywarden.evidence import render_evidence
+
+    return {
+        "report": document,
+        "csv": csv_text(rows),
+        "evidence": render_evidence(document),
+        "notes": notes,
+        "lab": body.get("target") == "lab",
+    }
 
 
 def run_where(body: dict) -> dict:

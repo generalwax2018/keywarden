@@ -17,6 +17,7 @@ from keywarden.check import FINGERPRINT, HostObservation, Policy, PriorFindings,
 from keywarden.collect import ProtocolError, collect_local, collect_remote, now_iso, parse_protocol, read_observation
 from keywarden.inventory import InventoryHost, parse_inventory
 from keywarden.parse import PrivateKeyError, parse_public_keys
+from keywarden.term import Paint, use_colour
 from keywarden.waivers import Waiver, apply_waivers, load_waivers
 
 MAX_INPUT_BYTES = 1_000_000
@@ -130,17 +131,35 @@ def _envelope(push: list) -> dict:
     }
 
 
-def _print_human(document: dict) -> None:
+_ORDER = {"fail": 0, "warn": 1, "accepted": 2, "pass": 3}
+
+
+def _summary(findings: list[dict]) -> str:
+    counts = {name: sum(1 for item in findings if item["severity"] == name) for name in ("fail", "warn", "accepted", "pass")}
+    parts = [f"{counts['fail']} fail", f"{counts['warn']} warn"]
+    if counts["accepted"]:
+        parts.append(f"{counts['accepted']} accepted")
+    parts.append(f"{counts['pass']} pass")
+    return " · ".join(parts)
+
+
+def _print_human(document: dict, paint: Paint | None = None, verbose: bool = False) -> None:
+    paint = paint or Paint(False)
     host = document["host"]
-    print(f"keywarden {document['version']}  {host['name']}  {host['posture'].upper()}")
-    for item in host["findings"]:
-        drift = f"  {item['drift']}" if item.get("drift") else ""
-        label = "ACPT" if item["severity"] == "accepted" else item["severity"].upper()
-        print(f"  {label:4}  {item['code']}{drift}  {item['title']}")
-        print(f"        {item['detail']}")
+    findings = sorted(host["findings"], key=lambda item: _ORDER.get(item["severity"], 4))
+    posture = host["posture"]
+    print(f"{paint('bold', 'keywarden ' + document['version'])}  {paint('bold', host['name'])}  {paint(posture, posture.upper())}  {paint('dim', _summary(findings))}")
+    shown = findings if verbose else [item for item in findings if item["severity"] != "pass"]
+    for item in shown:
+        drift = "  " + paint("warn", item["drift"]) if item.get("drift") else ""
+        print(f"  {paint.severity(item['severity'])}  {paint('dim', item['code'])}{drift}  {item['title']}")
+        print(f"        {paint.fingerprints(item['detail'])}")
         if item.get("newFingerprints"):
-            print(f"        new since the prior report: {' '.join(item['newFingerprints'])}")
-    print("key material omitted")
+            print(f"        new since the prior report: {paint.fingerprints(' '.join(item['newFingerprints']))}")
+    hidden = len(findings) - len(shown)
+    if hidden:
+        print(paint("dim", f"  {hidden} passing check{'s' if hidden != 1 else ''} hidden; --verbose shows them"))
+    print(paint("dim", "key material omitted"))
 
 
 def _print_keys(rows: list[dict]) -> None:
@@ -165,6 +184,16 @@ def _print_keys(rows: list[dict]) -> None:
     widths = [max(len(str(line[column])) for line in table) for column in range(len(header))]
     for line in table:
         print("  ".join(str(value).ljust(widths[column]) for column, value in enumerate(line)).rstrip())
+
+
+def _write_evidence(path: Path, document: dict) -> None:
+    from keywarden.evidence import render_evidence
+
+    path.write_text(render_evidence(document), encoding="utf-8")
+
+
+def _paint(args: argparse.Namespace) -> Paint:
+    return Paint(use_colour(getattr(args, "color", "auto")))
 
 
 def _write_csv(path: Path, rows: list[dict]) -> None:
@@ -306,10 +335,12 @@ def _check_one(args: argparse.Namespace) -> int:
         args.output.write_text(encoded, encoding="utf-8")
     if args.csv:
         _write_csv(args.csv, rows)
+    if args.evidence:
+        _write_evidence(args.evidence, document)
     if args.json:
         sys.stdout.write(encoded)
     else:
-        _print_human(document)
+        _print_human(document, _paint(args), args.verbose)
         if args.keys:
             print()
             _print_keys(rows)
@@ -380,13 +411,19 @@ def _check_inventory(args: argparse.Namespace) -> int:
         args.output.write_text(encoded, encoding="utf-8")
     if args.csv:
         _write_csv(args.csv, all_rows)
+    if args.evidence:
+        _write_evidence(args.evidence, document)
     if args.json:
         sys.stdout.write(encoded)
     else:
-        if lines:
-            print("\n".join(lines))
-        else:
-            print(f"{len(targets)} hosts  ok")
+        paint = _paint(args)
+        for line in lines:
+            first, _, rest = line.partition("  ")
+            print(f"{paint.fingerprints(first) if first.startswith('SHA256:') else paint('bold', first)}  {paint('fail', rest)}")
+        failing = sum(1 for item in host_reports if item["posture"] == "fail")
+        warning = sum(1 for item in host_reports if item["posture"] == "warn")
+        summary = f"{len(targets)} hosts · {failing} failing · {warning} to review · {len(targets) - failing - warning} clear"
+        print(paint("dim" if lines else "pass", summary))
         if args.keys:
             print()
             _print_keys(all_rows)
@@ -533,6 +570,9 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--json", action="store_true", help="print the JSON report")
     check.add_argument("--csv", type=Path, help="write the access review table (one row per authorized key) here")
     check.add_argument("--keys", action="store_true", help="also print the access review table")
+    check.add_argument("--evidence", type=Path, help="write an evidence report (HTML) with control mapping for an assessor")
+    check.add_argument("--verbose", "-v", action="store_true", help="also print passing checks")
+    check.add_argument("--color", choices=["auto", "always", "never"], default="auto", help="colour the terminal output (default: auto; NO_COLOR is honoured)")
     check.add_argument("--waivers", type=Path, help="accepted risks, JSON or TOML; each needs a reason, an owner or ticket, and an end date")
     check.add_argument("--stale-days", type=int, default=90, help="a key with no login in this many days is stale (default 90)")
     check.add_argument("--no-outside", action="store_true", help="do not flag keys missing from --allow")
