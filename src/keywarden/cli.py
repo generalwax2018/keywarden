@@ -7,6 +7,7 @@ import csv
 import dataclasses
 import io
 import json
+import os
 import sys
 from datetime import date
 from pathlib import Path
@@ -609,6 +610,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.inventory:
             return _check_inventory(args)
         return _check_one(args)
+    except BrokenPipeError:
+        # Output piped into head or similar that closed early; nothing went wrong.
+        try:
+            sys.stdout = open(os.devnull, "w")
+        except OSError:
+            pass
+        return 0
     except PrivateKeyError:
         print(
             "Refusing to continue: a private key was in the input. Keywarden accepts public keys only and did not keep a copy.",
@@ -618,6 +626,16 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
+    except Exception as exc:  # noqa: BLE001 - a bug should end in a message, not a traceback
+        if os.environ.get("KEYWARDEN_DEBUG"):
+            raise
+        print(
+            f"Keywarden hit an unexpected error ({type(exc).__name__}: {exc}). "
+            "Set KEYWARDEN_DEBUG=1 to see the details, and please report it at "
+            "https://github.com/generalwax2018/keywarden/issues",
+            file=sys.stderr,
+        )
+        return 3
 
 
 if __name__ == "__main__":

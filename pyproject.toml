@@ -1,6 +1,6 @@
 [project]
 name = "keywarden-ssh"
-version = "0.3.0"
+version = "0.3.1"
 description = "Check SSH posture around the public keys you push. Never stores them."
 readme = "README.md"
 license = "MIT"

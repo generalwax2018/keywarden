@@ -10,6 +10,15 @@ One command checks this machine, one host, or every host in an Ansible inventory
 
 `keywarden ui` on the built-in lab hosts. Screenshots: [findings, light](https://raw.githubusercontent.com/generalwax2018/keywarden/main/docs/screenshots/findings-light.webp) · [findings, dark](https://raw.githubusercontent.com/generalwax2018/keywarden/main/docs/screenshots/findings-dark.webp) · [access review](https://raw.githubusercontent.com/generalwax2018/keywarden/main/docs/screenshots/access-review.webp).
 
+## Try it in a minute
+
+```sh
+pip install keywarden-ssh
+keywarden ui
+```
+
+Your browser opens Keywarden. Press **Use Lab Keys**, then **Run Checks**, to see six made-up hosts with the kinds of problems real fleets have: a former employee's key on a shared admin account, a contractor key nobody uses, a root key that works from anywhere. Nothing is sent anywhere and nothing is stored. Then point it at a real host with **One host**.
+
 ## Install
 
 Python 3.9 or newer. No third-party packages. `--local` needs Linux or another POSIX system; the browser UI, `--host`, and `--inventory` also run on Windows using its built-in `ssh`.
@@ -21,7 +30,7 @@ python3 -m pip install keywarden-ssh
 Or straight from a tag:
 
 ```sh
-python3 -m pip install "git+https://github.com/generalwax2018/keywarden.git@v0.3.0"
+python3 -m pip install "git+https://github.com/generalwax2018/keywarden.git@v0.3.1"
 ```
 
 The distribution name is `keywarden-ssh`. The `keywarden` package on PyPI is an unrelated project; do not install it expecting this tool.

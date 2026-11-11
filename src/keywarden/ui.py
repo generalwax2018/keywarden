@@ -32,7 +32,15 @@ from keywarden.cli import (
     csv_text,
     prior_from_document,
 )
-from keywarden.collect import REMOTE_SCRIPT, ProtocolError, collect_local, collect_remote, parse_protocol
+from keywarden.collect import (
+    LOCAL_SUPPORTED,
+    LOCAL_UNSUPPORTED_MESSAGE,
+    REMOTE_SCRIPT,
+    ProtocolError,
+    collect_local,
+    collect_remote,
+    parse_protocol,
+)
 from keywarden.parse import KeyRef, PrivateKeyError, kind_of, parse_public_keys
 from keywarden.ui_lab import LAB_PUSH, lab_hosts
 from keywarden.ui_page import render_page
@@ -99,6 +107,8 @@ def _observations(body: dict):
             yield observation.name, observation, role, prior
         return
     if target == "local":
+        if not LOCAL_SUPPORTED:
+            raise BadRequest(LOCAL_UNSUPPORTED_MESSAGE.replace("--local", "This machine").replace(" or keywarden ui and its lab hosts", " or the lab hosts"))
         observation = collect_local(args.account)
         yield observation.name, observation, "This machine", None
         return
@@ -276,7 +286,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._headers(403, "text/plain; charset=utf-8", len(body))
                 return self.wfile.write(body)
             nonce = secrets.token_urlsafe(16)
-            page = render_page(nonce, self.server.token, __version__).encode("utf-8")
+            page = render_page(nonce, self.server.token, __version__, LOCAL_SUPPORTED).encode("utf-8")
             self._headers(200, "text/html; charset=utf-8", len(page), nonce)
             return self.wfile.write(page)
         return self._send_json(404, {"error": "not found"})
@@ -317,6 +327,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(400, {"error": "A private key was in the input. Keywarden takes public keys only and kept nothing."})
         except (BadRequest, ValueError, OSError, RuntimeError, json.JSONDecodeError) as exc:
             return self._send_json(400, {"error": str(exc)[:400]})
+        except Exception as exc:  # noqa: BLE001 - answer the page instead of dropping the connection
+            return self._send_json(500, {"error": f"Keywarden hit an unexpected error ({type(exc).__name__}). Please report it on GitHub."})
         finally:
             body.clear()
 

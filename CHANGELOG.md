@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1 — 2026-11-10
+
+- Windows: `--host` and `--inventory` send the collector script as bytes, so Windows no longer turns its newlines into CRLF on the way to the remote shell.
+- Windows: `--local` (and **This machine** in the GUI) explains that it needs to run on the Linux server instead of stopping with a Python error. The GUI greys the option out.
+- Unexpected errors end in a one-line message with a link to report them; `KEYWARDEN_DEBUG=1` shows the details. Piping output into `head` no longer prints an error.
+- README: a one-minute start with the lab hosts.
+
 ## 0.3.0 — 2026-11-10
 
 - Compliance mapping: every check maps to CIS Controls v8, NIST SP 800-53 Rev. 5, PCI DSS v4.0, and NERC CIP (CIP-004-7, CIP-005-7, CIP-007-6). Findings in the JSON report carry `controls`; the UI shows them under each finding. See docs/compliance.md.

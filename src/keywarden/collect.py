@@ -336,6 +336,18 @@ echo END
 """
 
 FINGERPRINT_TEXT = re.compile(r"SHA256:[A-Za-z0-9+/]+")
+LOCAL_SUPPORTED = os.name == "posix" and hasattr(os, "geteuid")
+LOCAL_UNSUPPORTED_MESSAGE = (
+    "--local reads this machine's sshd and user accounts, which only exist on Linux and other POSIX systems. "
+    "Run Keywarden on the server itself, or from here use --host user@server, --inventory hosts.ini, "
+    "or keywarden ui and its lab hosts."
+)
+
+
+def _euid() -> int:
+    return os.geteuid() if hasattr(os, "geteuid") else -1
+
+
 _DESTINATION = re.compile(r"^[A-Za-z0-9._:-]+@[A-Za-z0-9._:-]+$|^[A-Za-z0-9._:-]+$")
 _USERNAME = re.compile(r"^[a-z_][-a-z0-9_.]*\$?$", re.IGNORECASE)
 
@@ -446,7 +458,7 @@ def _run(command: list[str]) -> subprocess.CompletedProcess | None:
 
 def _sshd_output(binary: str, extra: list[str]) -> str | None:
     attempts = [[binary, "-T", *extra]]
-    if os.geteuid() != 0 and shutil.which("sudo"):
+    if _euid() != 0 and shutil.which("sudo"):
         attempts.append(["sudo", "-n", binary, "-T", *extra])
     for command in attempts:
         completed = _run(command)
@@ -619,6 +631,8 @@ def _run_long(command: list[str]) -> subprocess.CompletedProcess | None:
 
 
 def collect_local(extra_users: list[str] | None = None) -> HostObservation:
+    if not LOCAL_SUPPORTED:
+        raise ValueError(LOCAL_UNSUPPORTED_MESSAGE)
     records, passwd_state = _passwd_records()
     accounts = []
     for user in _ordered_users(extra_users or [], records):
@@ -652,7 +666,7 @@ def collect_local(extra_users: list[str] | None = None) -> HostObservation:
         sshd_state=sshd_state,
         match_blocks=match,
         sshd_root=root,
-        privilege="root" if os.geteuid() == 0 else "none",
+        privilege="root" if _euid() == 0 else "none",
         now=now,
         log_source=log_source,
         log_since=log_since,
@@ -894,6 +908,12 @@ def _parse_account(lines: list[str], index: int) -> tuple[Account, int]:
     return account, index
 
 
+def _text(data) -> str:
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    return data or ""
+
+
 def collect_remote(
     destination: str,
     extra_users: list[str] | None = None,
@@ -933,11 +953,12 @@ def collect_remote(
         options.extend(["-i", os.path.expanduser(identity_file), "-o", "IdentitiesOnly=yes"])
     command = ["ssh", *options, "--", destination, "sh", "-s", "--", *users]
     try:
+        # Bytes, not text: in text mode Windows would turn every newline in the
+        # script into CRLF on the way to the remote sh, and the script would fail.
         completed = subprocess.run(
             command,
-            input=REMOTE_SCRIPT,
+            input=REMOTE_SCRIPT.encode("utf-8"),
             capture_output=True,
-            text=True,
             timeout=60,
             check=False,
         )
@@ -945,14 +966,15 @@ def collect_remote(
         raise RuntimeError("ssh timed out before a check could finish") from exc
     except OSError as exc:
         raise RuntimeError("ssh is not available on this machine") from exc
+    stderr = _text(completed.stderr)
     if completed.returncode != 0:
         tail = ""
-        for line in reversed((completed.stderr or "").splitlines()):
+        for line in reversed(stderr.splitlines()):
             if line.strip() and "PRIVATE KEY" not in line and "ssh-" not in line:
                 tail = line.strip()[:180]
                 break
         raise RuntimeError(tail or f"ssh exited {completed.returncode}")
-    output = completed.stdout
+    output = _text(completed.stdout)
     try:
         return parse_protocol(output, address=destination)
     finally:

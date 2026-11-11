@@ -119,6 +119,7 @@ textarea:focus, input[type=text]:focus, input[type=number]:focus { outline: none
 .option .text { display: grid; gap: 1px; min-width: 0; }
 .option small { color: var(--secondary); font-size: 12px; }
 .option .sub { grid-column: 1 / -1; margin-top: 6px; }
+.option.disabled { opacity: .5; cursor: not-allowed; }
 .option input[type=radio] { appearance: none; -webkit-appearance: none; width: 16px; height: 16px; margin: 0; border-radius: 50%; border: 1.5px solid var(--separator-strong); background: var(--glass-strong); }
 .option input[type=radio]:checked { border: 5px solid var(--blue); background: #fff; }
 .option input[type=checkbox] { appearance: none; -webkit-appearance: none; width: 36px; height: 22px; border-radius: 11px; background: var(--fill-strong); position: relative; margin: 0; cursor: pointer; transition: background .2s; flex: none; box-shadow: inset 0 1px 2px rgba(0,0,0,.12); }
@@ -338,6 +339,7 @@ td.fp, td.mono { font-family: var(--mono); font-size: 12px; }
 <script nonce="__NONCE__">
 "use strict";
 const TOKEN = "__TOKEN__";
+const LOCAL_OK = __LOCAL_OK__;
 history.replaceState(null, "", "/");
 
 const $ = (id) => document.getElementById(id);
@@ -654,6 +656,13 @@ $("prior").addEventListener("change", async (event) => {
 });
 for (const tab of document.querySelectorAll('[role="tab"]')) tab.addEventListener("click", () => showView(tab.dataset.view));
 for (const id of ["host", "inventory"]) $(id).addEventListener("focus", () => { $(id === "host" ? "t-host" : "t-inv").checked = true; });
+if (!LOCAL_OK) {
+  // sshd and the account database live on the server; a Windows desktop has neither.
+  $("t-local").disabled = true;
+  const row = $("t-local").closest(".option");
+  row.classList.add("disabled");
+  row.querySelector("small").textContent = "Not on Windows. Run Keywarden on the Linux server, or check it as One host.";
+}
 renderPush(); renderAll([]);
 </script>
 </body>
@@ -661,5 +670,10 @@ renderPush(); renderAll([]);
 """
 
 
-def render_page(nonce: str, token: str, version: str) -> str:
-    return PAGE.replace("__NONCE__", nonce).replace("__TOKEN__", token).replace("__VERSION__", version)
+def render_page(nonce: str, token: str, version: str, local_ok: bool = True) -> str:
+    return (
+        PAGE.replace("__NONCE__", nonce)
+        .replace("__TOKEN__", token)
+        .replace("__VERSION__", version)
+        .replace("__LOCAL_OK__", "true" if local_ok else "false")
+    )
