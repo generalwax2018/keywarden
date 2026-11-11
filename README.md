@@ -6,9 +6,16 @@ You keep using whatever already places `authorized_keys` on a machine (Ansible, 
 
 One command checks this machine, one host, or every host in an Ansible inventory. It is a point-in-time check: there is no daemon, scheduler, or stored state.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/findings-dark.webp">
+  <img alt="keywarden ui showing six lab hosts: summary tiles, then app-web-03 with failing root login, root key, and stale key checks" src="docs/screenshots/findings-light.webp">
+</picture>
+
+`keywarden ui` on the built-in lab hosts. The same checks run from the command line. [Access review table](docs/screenshots/access-review.webp).
+
 ## Install
 
-Python 3.9 or newer, on Linux or another POSIX system. No third-party packages.
+Python 3.9 or newer. No third-party packages. `--local` needs Linux or another POSIX system; the browser UI, `--host`, and `--inventory` also run on Windows using its built-in `ssh`.
 
 ```sh
 python3 -m pip install "git+https://github.com/generalwax2018/keywarden.git@v0.2.0"
