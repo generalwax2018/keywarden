@@ -64,7 +64,7 @@ button, input, textarea { font: inherit; color: inherit; }
 :focus-visible { outline: 3px solid color-mix(in srgb, var(--blue) 55%, transparent); outline-offset: 1px; border-radius: 10px; }
 
 /* Glass surfaces: frosted fill, a bright top edge, a faint outer edge, and soft depth. */
-.glass, .toolbar-inner, .sidebar, .card, .stat, .host, .table-wrap, .empty, .hit, .error {
+.glass, .toolbar-inner, .sidebar, .card, .stat, .host, .table-wrap, .empty, .hit, .error, .changes {
   background: var(--glass); backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);
   border: 1px solid var(--glass-border); box-shadow: inset 0 1px 0 var(--glass-shine), 0 0 0 .5px var(--glass-edge), var(--shadow);
 }
@@ -228,6 +228,12 @@ td.fp, td.mono { font-family: var(--mono); font-size: 12px; }
   @media (prefers-color-scheme: dark) { :root { --glass: rgba(28,32,44,.94); --glass-strong: rgba(36,40,54,.96); --glass-soft: rgba(255,255,255,.06); } }
 }
 .legal { color: var(--tertiary); font-size: 11.5px; padding: 0 10px; margin: 0; }
+.legal .btn.plain { font-size: 11.5px; padding: 0; }
+.changes { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; padding: 10px 14px; border-radius: 14px; font-size: 13px; }
+.changes b { font-weight: 600; }
+.chg { display: inline-flex; gap: 6px; align-items: center; }
+.chg::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--tertiary); }
+.chg.bad::before { background: var(--red); } .chg.good::before { background: var(--green); } .chg.warnc::before { background: var(--orange); }
 </style>
 </head>
 <body>
@@ -291,6 +297,7 @@ td.fp, td.mono { font-family: var(--mono); font-size: 12px; }
         <label class="option"><span class="text"><span>Flag keys outside the push</span><small>Anything authorized you did not push</small></span><input type="checkbox" id="flag-outside" checked></label>
         <label class="option"><span class="text"><span>Flag weak algorithms</span><small>DSA, and RSA under 3072 bits</small></span><input type="checkbox" id="flag-weak" checked></label>
         <div class="field inline"><label for="stale">Stale after (days)</label><input type="number" id="stale" min="1" max="3650" value="90"><small>Counted only when the host's logs go back that far</small></div>
+        <div class="field inline"><label for="jobs">Hosts at once</label><input type="number" id="jobs" min="1" max="32" value="8"><small>For inventories. Each host is one SSH session.</small></div>
         <div class="field"><label for="accounts">Extra accounts</label><input type="text" id="accounts" placeholder="postgres, svc-backup" autocomplete="off" spellcheck="false"></div>
         <div class="field"><label for="waivers">Waivers file</label><input type="text" id="waivers" placeholder="~/keywarden.toml" autocomplete="off" spellcheck="false"></div>
         <div class="field"><label for="prior">Earlier report</label><input type="file" id="prior" accept=".json,application/json"><small>Marks what regressed since then. Read in this window only.</small></div>
@@ -309,7 +316,8 @@ td.fp, td.mono { font-family: var(--mono); font-size: 12px; }
         </div>
       </details>
     </section>
-    <p class="legal">Runs on this machine and talks only to the hosts you check. Open source, MIT.</p>
+    <p class="legal">Runs on this machine and talks only to the hosts you check. Settings and a summary of each host's last results are remembered in this browser; keys never are. <button class="btn plain" id="forget" type="button">Forget</button></p>
+    <p class="legal">Open source, MIT.</p>
   </aside>
 
   <main class="content" id="results" aria-label="Results">
@@ -318,6 +326,7 @@ td.fp, td.mono { font-family: var(--mono); font-size: 12px; }
       <div id="filters"></div>
     </div>
     <div id="message"></div>
+    <div id="changes"></div>
     <div class="stats" id="stats"></div>
     <div id="view-findings"></div>
     <div id="view-review" hidden></div>
@@ -386,6 +395,49 @@ async function api(path, body) {
 function showError(text) { $("message").replaceChildren(text ? h("div", { class: "error", role: "alert" }, text) : ""); }
 function showInfo(text) { $("message").replaceChildren(h("p", { class: "info", role: "status" }, text)); }
 
+// Per-browser memory. Settings and last-run summaries only: codes, severities, fingerprints.
+// Never key text, collector output, or the "trust new host keys" switch.
+const STORE = { settings: "keywarden.settings.v1", previous: "keywarden.previous.v1" };
+function load(key, fallback) { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } }
+function save(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* private window or storage off */ } }
+const SETTING_FIELDS = ["host", "inventory", "stale", "jobs", "accounts", "waivers"];
+const SETTING_SWITCHES = ["flag-outside", "flag-weak"];
+function saveSettings() {
+  const data = { target: selectedTarget() };
+  for (const id of SETTING_FIELDS) data[id] = $(id).value;
+  for (const id of SETTING_SWITCHES) data[id] = $(id).checked;
+  save(STORE.settings, data);
+}
+function restoreSettings() {
+  const data = load(STORE.settings, null);
+  if (!data) return;
+  for (const id of SETTING_FIELDS) if (typeof data[id] === "string") $(id).value = data[id];
+  for (const id of SETTING_SWITCHES) if (typeof data[id] === "boolean") $(id).checked = data[id];
+  const radio = document.querySelector(`input[name="target"][value="${CSS.escape(String(data.target || "lab"))}"]`);
+  if (radio && !(radio.value === "local" && !LOCAL_OK)) radio.checked = true;
+}
+function rememberRun(report) {
+  const previous = load(STORE.previous, {});
+  for (const host of report.hosts) {
+    if (!host.findings || host.findings.some((f) => f.code === "unreachable" || f.code === "collector-output")) continue;
+    const summary = {};
+    for (const f of host.findings) summary[f.code] = [f.was || f.severity, f.fingerprints || []];
+    previous[host.name] = summary;
+  }
+  const names = Object.keys(previous);
+  for (const name of names.slice(0, Math.max(0, names.length - 2000))) delete previous[name];
+  save(STORE.previous, previous);
+}
+function renderChanges(report, compared) {
+  const box = $("changes");
+  if (!report || !compared) { box.replaceChildren(); return; }
+  const count = (kind) => report.hosts.reduce((n, h) => n + (h.findings || []).filter((f) => f.drift === kind).length, 0);
+  const items = [["new", "new", "bad"], ["regressed", "regressed", "bad"], ["new-keys", "with new keys", "warnc"], ["cleared", "cleared", "good"]]
+    .map(([kind, label, cls]) => [count(kind), label, cls]).filter(([n]) => n);
+  box.replaceChildren(h("div", { class: "changes" }, h("b", {}, "Since your last run:"),
+    items.length ? items.map(([n, label, cls]) => h("span", { class: "chg " + cls }, `${n} ${label}`)) : h("span", { class: "chg good" }, "no changes")));
+}
+
 function selectedTarget() { return document.querySelector('input[name="target"]:checked').value; }
 function baseBody(target) {
   return {
@@ -394,6 +446,7 @@ function baseBody(target) {
     inventoryPath: $("inventory").value.trim(),
     acceptNew: $("accept-new").checked,
     accounts: $("accounts").value.split(/[\s,]+/).filter(Boolean),
+    jobs: Math.min(32, Math.max(1, parseInt($("jobs").value, 10) || 8)),
   };
 }
 
@@ -416,6 +469,9 @@ async function runCheck(target) {
     waiversPath: $("waivers").value.trim(),
     prior: state.prior,
   });
+  const previous = target === "lab" ? {} : load(STORE.previous, {});
+  body.previous = previous;
+  saveSettings();
   if (target === "paste") body.observation = $("observation").value;
   // The key text leaves the page now. It is not kept here, sent again, or saved.
   $("allow").value = "";
@@ -428,6 +484,12 @@ async function runCheck(target) {
     state.lab = data.lab;
     $("export-json").disabled = false; $("export-csv").disabled = false; $("export-evidence").disabled = false;
     renderPush(); renderAll(data.notes || []);
+    if (!data.lab) {
+      renderChanges(data.report, data.report.hosts.some((host) => previous[host.name]));
+      rememberRun(data.report);
+    } else {
+      renderChanges(null, false);
+    }
   } catch (error) {
     showError(error.message);
   } finally {
@@ -656,6 +718,14 @@ $("prior").addEventListener("change", async (event) => {
 });
 for (const tab of document.querySelectorAll('[role="tab"]')) tab.addEventListener("click", () => showView(tab.dataset.view));
 for (const id of ["host", "inventory"]) $(id).addEventListener("focus", () => { $(id === "host" ? "t-host" : "t-inv").checked = true; });
+restoreSettings();
+for (const id of [...SETTING_FIELDS, ...SETTING_SWITCHES]) $(id).addEventListener("change", saveSettings);
+for (const radio of document.querySelectorAll('input[name="target"]')) radio.addEventListener("change", saveSettings);
+$("forget").addEventListener("click", () => {
+  try { localStorage.removeItem(STORE.settings); localStorage.removeItem(STORE.previous); } catch { /* storage off */ }
+  renderChanges(null, false);
+  showInfo("Forgot saved settings and last-run history in this browser.");
+});
 if (!LOCAL_OK) {
   // sshd and the account database live on the server; a Windows desktop has neither.
   $("t-local").disabled = true;

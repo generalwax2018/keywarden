@@ -16,13 +16,14 @@ from keywarden import __version__
 from keywarden.access import key_rows, reach_of
 from keywarden.check import FINGERPRINT, HostObservation, Policy, PriorFindings, apply_drift, evaluate, worst
 from keywarden.collect import ProtocolError, collect_local, collect_remote, now_iso, parse_protocol, read_observation
-from keywarden.inventory import InventoryHost, parse_inventory
+from keywarden.inventory import InventoryHost, looks_like_yaml, parse_inventory, parse_inventory_json
 from keywarden.parse import PrivateKeyError, parse_public_keys
 from keywarden.term import Paint, use_colour
 from keywarden.waivers import Waiver, apply_waivers, load_waivers
 
 MAX_INPUT_BYTES = 1_000_000
-MAX_INVENTORY_HOSTS = 256
+MAX_INVENTORY_HOSTS = 2000
+MAX_JOBS = 32
 _FINGERPRINT = FINGERPRINT
 CSV_COLUMNS = [
     "host",
@@ -193,6 +194,16 @@ def _write_evidence(path: Path, document: dict) -> None:
     path.write_text(render_evidence(document), encoding="utf-8")
 
 
+def _write_machine_outputs(args: argparse.Namespace, document: dict) -> None:
+    from keywarden.outputs import to_jsonl, to_sarif
+
+    if getattr(args, "sarif", None):
+        inventory = getattr(args, "inventory", None)
+        args.sarif.write_text(json.dumps(to_sarif(document, inventory), indent=2) + "\n", encoding="utf-8")
+    if getattr(args, "jsonl", None):
+        args.jsonl.write_text(to_jsonl(document), encoding="utf-8")
+
+
 def _paint(args: argparse.Namespace) -> Paint:
     return Paint(use_colour(getattr(args, "color", "auto")))
 
@@ -288,14 +299,55 @@ def _observe_one(args: argparse.Namespace) -> HostObservation:
         del raw
 
 
-def _targets(path: Path) -> list[InventoryHost]:
-    text = path.read_text(encoding="utf-8", errors="replace")
+def _ansible_inventory_json(path: Path) -> str:
+    """Let Ansible resolve YAML files, plugins, and dynamic inventory scripts, then read its JSON."""
+    import shutil
+    import subprocess
+
+    binary = shutil.which("ansible-inventory")
+    if binary is None:
+        raise ValueError(
+            f"{path.name} is not an INI inventory. Install Ansible so Keywarden can read it with ansible-inventory, "
+            f"or run 'ansible-inventory -i {path.name} --list > inventory.json' and pass --inventory inventory.json"
+        )
     try:
-        if len(text.encode("utf-8", errors="replace")) > MAX_INPUT_BYTES:
-            raise ValueError("inventory is larger than 1 MB")
+        completed = subprocess.run(
+            [binary, "-i", str(path), "--list"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("ansible-inventory did not finish within 3 minutes") from exc
+    if completed.returncode != 0:
+        tail = (completed.stderr or "").strip().splitlines()[-1:] or [f"exit {completed.returncode}"]
+        raise ValueError(f"ansible-inventory could not read {path.name}: {tail[0][:200]}")
+    return completed.stdout
+
+
+def _targets(path: Path) -> list[InventoryHost]:
+    if path.is_dir():
+        text = _ansible_inventory_json(path)
+        kind = "json"
+    else:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        stripped = text.lstrip()
+        if path.suffix.lower() == ".json" or stripped.startswith("{"):
+            kind = "json"
+        elif looks_like_yaml(text, path.name) or stripped.startswith("#!"):
+            # YAML, an inventory plugin config, or a dynamic inventory script.
+            text = _ansible_inventory_json(path)
+            kind = "json"
+        else:
+            kind = "ini"
+    try:
+        if len(text.encode("utf-8", errors="replace")) > 20 * MAX_INPUT_BYTES:
+            raise ValueError("inventory is larger than 20 MB")
         if "PRIVATE KEY" in text or "-----BEGIN" in text or "PuTTY-User-Key-File" in text:
             raise PrivateKeyError("private key material was present and was not recorded")
-        targets = parse_inventory(text, source=path.name)
+        targets = parse_inventory_json(text) if kind == "json" else parse_inventory(text, source=path.name)
     finally:
         del text
     if not targets:
@@ -303,6 +355,24 @@ def _targets(path: Path) -> list[InventoryHost]:
     if len(targets) > MAX_INVENTORY_HOSTS:
         raise ValueError(f"inventory has more than {MAX_INVENTORY_HOSTS} hosts")
     return targets
+
+
+def observe_all(targets: list[InventoryHost], args, jobs: int):
+    """Observe every target, several at a time, and return (target, observation or error) in inventory order."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    jobs = max(1, min(int(jobs or 1), MAX_JOBS, len(targets) or 1))
+
+    def one(target: InventoryHost):
+        try:
+            return target, _observe_target(target, args)
+        except Exception as exc:  # noqa: BLE001 - reported per host; the run continues
+            return target, exc
+
+    if jobs == 1:
+        return [one(target) for target in targets]
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        return list(pool.map(one, targets))
 
 
 def _observe_target(target: InventoryHost, args: argparse.Namespace) -> HostObservation:
@@ -338,6 +408,7 @@ def _check_one(args: argparse.Namespace) -> int:
         _write_csv(args.csv, rows)
     if args.evidence:
         _write_evidence(args.evidence, document)
+    _write_machine_outputs(args, document)
     if args.json:
         sys.stdout.write(encoded)
     else:
@@ -385,15 +456,13 @@ def _check_inventory(args: argparse.Namespace) -> int:
     plain: list[str] = []
     used: set[int] = set()
     today = date.today()
-    for target in targets:
-        try:
-            observed = _observe_target(target, args)
-        except ProtocolError as exc:
-            host_reports.append(_unreachable(target.name, target.destination, str(exc), code="collector-output"))
+    for target, observed in observe_all(targets, args, args.jobs):
+        if isinstance(observed, ProtocolError):
+            host_reports.append(_unreachable(target.name, target.destination, str(observed), code="collector-output"))
             plain.append(f"{target.name}  collector-output")
             continue
-        except (OSError, RuntimeError, ValueError) as exc:
-            host_reports.append(_unreachable(target.name, target.destination, str(exc)))
+        if isinstance(observed, Exception):
+            host_reports.append(_unreachable(target.name, target.destination, str(observed)))
             plain.append(f"{target.name}  unreachable")
             continue
         if args.redact_comments:
@@ -414,6 +483,7 @@ def _check_inventory(args: argparse.Namespace) -> int:
         _write_csv(args.csv, all_rows)
     if args.evidence:
         _write_evidence(args.evidence, document)
+    _write_machine_outputs(args, document)
     if args.json:
         sys.stdout.write(encoded)
     else:
@@ -515,11 +585,9 @@ def _where(args: argparse.Namespace) -> int:
     hits: list[dict] = []
     blind: list[str] = []
     if args.inventory:
-        for target in _targets(args.inventory):
-            try:
-                host = _observe_target(target, args)
-            except (OSError, RuntimeError, ValueError) as exc:
-                blind.append(f"{target.name}  not checked: {str(exc)[:120]}")
+        for target, host in observe_all(_targets(args.inventory), args, args.jobs):
+            if isinstance(host, Exception):
+                blind.append(f"{target.name}  not checked: {str(host)[:120]}")
                 continue
             hits.extend(_matches(host, wanted_set))
             blind.extend(f"{host.name}  {account.user} could not be read" for account in host.accounts if account.read_state == "unreadable")
@@ -547,6 +615,7 @@ def _add_source(parser: argparse.ArgumentParser, inventory_help: str) -> None:
     source.add_argument("--host", help="ssh to user@host in batch mode and read it")
     source.add_argument("--observation", help="collector output file, or - for stdin")
     source.add_argument("--inventory", type=Path, help=inventory_help)
+    parser.add_argument("--jobs", "-j", type=int, default=8, help=f"hosts to check at once with --inventory (1-{MAX_JOBS}, default 8)")
     parser.add_argument("--account", action="append", default=[], help="extra account to read; repeatable")
     parser.add_argument(
         "--accept-new",
@@ -564,7 +633,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     check = sub.add_parser("check", help="check one host, or every host in an Ansible inventory")
-    _add_source(check, "Ansible INI inventory; failures only, one SSH per host")
+    _add_source(check, "Ansible inventory: INI, ansible-inventory --list JSON, or YAML/dynamic (needs Ansible installed)")
     check.add_argument("--allow", type=Path, help="public keys you push; fingerprinted, not copied into the report")
     check.add_argument("--prior", type=Path, help="earlier keywarden JSON report, for drift")
     check.add_argument("--output", type=Path, help="write the JSON report here")
@@ -573,6 +642,8 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--keys", action="store_true", help="also print the access review table")
     check.add_argument("--evidence", type=Path, help="write an evidence report (HTML) with control mapping for an assessor")
     check.add_argument("--verbose", "-v", action="store_true", help="also print passing checks")
+    check.add_argument("--sarif", type=Path, help="write findings as SARIF 2.1.0, for GitHub code scanning and similar")
+    check.add_argument("--jsonl", type=Path, help="write one JSON event per finding and per key, for a SIEM")
     check.add_argument("--color", choices=["auto", "always", "never"], default="auto", help="colour the terminal output (default: auto; NO_COLOR is honoured)")
     check.add_argument("--waivers", type=Path, help="accepted risks, JSON or TOML; each needs a reason, an owner or ticket, and an end date")
     check.add_argument("--stale-days", type=int, default=90, help="a key with no login in this many days is stale (default 90)")
@@ -592,7 +663,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_source(where, "Ansible INI inventory; one SSH per host")
 
     ui = sub.add_parser("ui", help="open the checks in a browser tab served from this machine only")
-    ui.add_argument("--port", type=int, default=0, help="port on 127.0.0.1 (default: any free port)")
+    ui.add_argument("--port", type=int, default=None, help="port on 127.0.0.1 (default 8765, or any free port if it is taken)")
     ui.add_argument("--no-browser", action="store_true", help="print the link instead of opening it")
     return parser
 

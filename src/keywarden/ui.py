@@ -26,8 +26,8 @@ from keywarden.cli import (
     _envelope,
     _host_report,
     _matches,
-    _observe_target,
     _targets,
+    observe_all,
     _unreachable,
     csv_text,
     prior_from_document,
@@ -141,16 +141,40 @@ def _observations(body: dict):
     path = Path(str(body.get("inventoryPath") or "").strip()).expanduser()
     if not str(path) or not path.is_file():
         raise BadRequest("Enter the path to an INI inventory on this machine.")
-    for target_host in _targets(path):
-        try:
-            observation = _observe_target(target_host, args)
-        except ProtocolError as exc:
-            yield target_host.name, _unreachable(target_host.name, target_host.destination, str(exc), code="collector-output"), "", None
+    jobs = body.get("jobs", 8)
+    if not isinstance(jobs, int) or not 1 <= jobs <= 32:
+        raise BadRequest("Hosts at once must be between 1 and 32.")
+    for target_host, observation in observe_all(_targets(path), args, jobs):
+        if isinstance(observation, ProtocolError):
+            yield target_host.name, _unreachable(target_host.name, target_host.destination, str(observation), code="collector-output"), "", None
+        elif isinstance(observation, Exception):
+            yield target_host.name, _unreachable(target_host.name, target_host.destination, str(observation)), "", None
+        else:
+            yield target_host.name, observation, "", None
+
+
+def _previous_runs(value) -> dict:
+    """{host: {code: [severity, [fingerprints]]}} from the page, validated; anything odd is ignored."""
+    result: dict = {}
+    if not isinstance(value, dict):
+        return result
+    for host, findings in list(value.items())[:2000]:
+        if not isinstance(host, str) or not isinstance(findings, dict):
             continue
-        except (OSError, RuntimeError, ValueError) as exc:
-            yield target_host.name, _unreachable(target_host.name, target_host.destination, str(exc)), "", None
-            continue
-        yield target_host.name, observation, "", None
+        summary = {}
+        for code, entry in findings.items():
+            if (
+                isinstance(code, str)
+                and isinstance(entry, list)
+                and len(entry) == 2
+                and entry[0] in {"pass", "warn", "fail", "accepted"}
+                and isinstance(entry[1], list)
+            ):
+                prints = {str(item) for item in entry[1] if FINGERPRINT.fullmatch(str(item))}
+                summary[code] = ("fail" if entry[0] == "fail" else entry[0], prints)
+        if summary:
+            result[host] = summary
+    return result
 
 
 def run_check(body: dict) -> dict:
@@ -161,6 +185,9 @@ def run_check(body: dict) -> dict:
     if waiver_path:
         waivers = load_waivers(Path(waiver_path).expanduser())
     uploaded_prior = body.get("prior")
+    # The page keeps a summary of each host's last run (codes, severities, fingerprints; no keys)
+    # and sends it back so drift shows without uploading a report.
+    previous = _previous_runs(body.get("previous"))
     used: set[int] = set()
     hosts: list[dict] = []
     rows: list[dict] = []
@@ -174,6 +201,8 @@ def run_check(body: dict) -> dict:
             # The lab's previous run: today's results, except where it says a check was different.
             prior = {item.code: (item.severity, set(item.fingerprints)) for item in evaluate(observed, push, policy)}
             prior.update(lab_prior)
+        if previous.get(observed.name) and lab_prior is None:
+            prior = previous[observed.name]
         if uploaded_prior is not None:
             prior = prior_from_document(uploaded_prior, observed.name) or prior
         findings = apply_drift(evaluate(observed, push, policy), prior)
@@ -341,8 +370,20 @@ class KeywardenServer(ThreadingHTTPServer):
         self.token = secrets.token_urlsafe(24)
 
 
-def serve(port: int = 0, open_browser: bool = True) -> int:
-    server = KeywardenServer(port)
+DEFAULT_PORT = 8765
+
+
+def serve(port: int | None = None, open_browser: bool = True) -> int:
+    # A fixed port keeps the page's origin the same between runs, so the settings it
+    # remembers (never keys) come back. If it is taken, any free port works.
+    if port is None:
+        try:
+            server = KeywardenServer(DEFAULT_PORT)
+        except OSError:
+            server = KeywardenServer(0)
+            print(f"Port {DEFAULT_PORT} is in use; settings saved in the page will not carry over this time.")
+    else:
+        server = KeywardenServer(port)
     url = f"http://127.0.0.1:{server.server_address[1]}/?t={server.token}"
     print(f"Keywarden is running at {url}")
     print("Only this machine can reach it. Press Ctrl+C to stop; nothing is kept when it stops.")

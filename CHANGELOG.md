@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0 — 2026-11-17
+
+- Parallel inventory runs: `--jobs` (default 8, up to 32) for `check` and `where`, and a **Hosts at once** setting in the GUI. Results stay in inventory order. Up to 2,000 hosts per run.
+- Inventories: JSON from `ansible-inventory --list`, and YAML, inventory plugins, dynamic scripts, and inventory directories through `ansible-inventory` when Ansible is installed.
+- `--sarif` for GitHub code scanning (alerts point at the host's inventory line; controls as tags) and `--jsonl` for SIEM ingestion (one event per finding and per key).
+- GUI: remembers settings and a summary of each host's last results in the browser (never keys), shows **Since your last run** with new, regressed, new-key, and cleared findings, and runs on port 8765 by default so that memory carries over. **Forget** clears it.
+- Compliance mapping review: `auth-log` now warns when sshd's login log covers less than 90 days, and maps to log retention (CIS 8.10, NIST AU-11, PCI DSS 10.5.1) instead of log review. docs/compliance.md records how the mapping was checked, and a new issue template takes corrections.
+
 ## 0.3.1 — 2026-11-10
 
 - Windows: `--host` and `--inventory` send the collector script as bytes, so Windows no longer turns its newlines into CRLF on the way to the remote shell.

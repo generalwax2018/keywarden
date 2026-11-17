@@ -700,7 +700,7 @@ class InventoryGroupTests(unittest.TestCase):
 
         with self.assertRaises(ValueError) as caught:
             parse_inventory("all:\n  hosts:\n    web-01:\n")
-        self.assertIn("INI", str(caught.exception))
+        self.assertIn("ansible-inventory", str(caught.exception))
         with self.assertRaises(ValueError):
             parse_inventory("web-01\n", source="hosts.yml")
 

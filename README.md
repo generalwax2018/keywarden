@@ -30,7 +30,7 @@ python3 -m pip install keywarden-ssh
 Or straight from a tag:
 
 ```sh
-python3 -m pip install "git+https://github.com/generalwax2018/keywarden.git@v0.3.1"
+python3 -m pip install "git+https://github.com/generalwax2018/keywarden.git@v0.4.0"
 ```
 
 The distribution name is `keywarden-ssh`. The `keywarden` package on PyPI is an unrelated project; do not install it expecting this tool.
@@ -51,7 +51,9 @@ keywarden ui
 
 This opens Keywarden in a browser tab, served from your machine. Paste the public keys you push, choose what to check (this machine, one host, an Ansible inventory, or collector output you paste), and run. Results show failing hosts first, with the access review table and a "find a key" search beside them. Export the findings as JSON or the key table as CSV. Press **Fill lab keys** and **Run checks** to try it on six made-up hosts first.
 
-The server listens on `127.0.0.1` only, on a random port, and the link it prints carries a one-time token. It refuses requests without that token, from another web page, or with a Host header other than localhost, so a site you visit cannot drive it. The page loads nothing from the internet. Key text is fingerprinted on arrival and cleared from the box; the tab holds fingerprints only, and nothing is written to disk unless you export. Use `--port` to pick the port and `--no-browser` to print the link without opening it.
+The server listens on `127.0.0.1` only, on port 8765 (or any free port if that one is taken), and the link it prints carries a one-time token. It refuses requests without that token, from another web page, or with a Host header other than localhost, so a site you visit cannot drive it. The page loads nothing from the internet. Key text is fingerprinted on arrival and cleared from the box; the tab holds fingerprints only. Use `--port` to pick the port and `--no-browser` to print the link without opening it.
+
+The page remembers your settings (what to check, paths, day counts) and a summary of each host's last results (check codes, results, and fingerprints) in this browser, so the next run shows **Since your last run: 2 new, 1 cleared** and marks each change. Keys, collector output, and the "trust new host keys" switch are never remembered. **Forget** in the sidebar clears it.
 
 ## Check this machine
 
@@ -93,7 +95,13 @@ Every line read from an `authorized_keys` file is prefixed before it crosses the
 keywarden check --inventory hosts.ini --allow team.pub
 ```
 
-`hosts.ini` is the INI inventory you already use. Keywarden reads `ansible_user`, `ansible_host`, `ansible_port`, and `ansible_ssh_private_key_file` (and their `ansible_ssh_*` spellings), from host lines, `[group:vars]`, and parent groups through `[group:children]`. A nearer group overrides a parent, and a host line overrides both, as in Ansible. A private-key path is handed to `ssh -i`; Keywarden never opens the file. Passwords, become passwords, and every other variable are dropped as the file is read. YAML inventories are not supported yet and are refused with a message. Each host is one SSH, in order. A host that cannot be reached is a failure, and the rest are still checked.
+`--inventory` takes the inventory you already use:
+
+- **INI** files are read directly.
+- **YAML**, inventory plugins (AWS, Azure, GCP, and others), dynamic inventory scripts, and inventory directories are handed to `ansible-inventory --list`, so Ansible resolves them exactly as it would for a playbook. That needs Ansible installed where Keywarden runs; without it, Keywarden says so.
+- **JSON** from `ansible-inventory -i <anything> --list > inventory.json` is read directly, so Ansible does not have to be installed on the machine running Keywarden.
+
+From an INI file, Keywarden reads `ansible_user`, `ansible_host`, `ansible_port`, and `ansible_ssh_private_key_file` (and their `ansible_ssh_*` spellings), from host lines, `[group:vars]`, and parent groups through `[group:children]`. A nearer group overrides a parent, and a host line overrides both, as in Ansible. A private-key path is handed to `ssh -i`; Keywarden never opens the file. Passwords, become passwords, and every other variable are dropped as the file is read. From JSON, Ansible has already merged those variables into each host. Hosts are checked eight at a time by default (`--jobs 1` to `--jobs 32`), each over its own SSH session, and reported in inventory order. A host that cannot be reached is a failure, and the rest are still checked.
 
 The terminal shows failures only. A check that names a key is printed once per fingerprint, with every host where that fingerprint failed. Other failures stay on their own line: hostname and check. Passes are not printed. Exit 1 if any host failed. `--output` writes the JSON report, still without key bodies. The `fingerprints` array is the unique set. `--prior` is for one host, not an inventory.
 
@@ -180,6 +188,24 @@ Each `sudo -l -U` call is written to the host's auth log by sudo itself.
 
 Only the newest login line and a count per account and key leave the host. Pass `--redact-addresses` to drop the last login address from the output.
 
+## Pipelines and SIEM
+
+```sh
+keywarden check --inventory hosts.ini --allow team.pub --sarif keywarden.sarif --jsonl keywarden.jsonl
+```
+
+`--sarif` writes SARIF 2.1.0. Upload it to GitHub code scanning and each finding becomes an alert on the inventory line for that host, with its controls as tags; alerts are deduplicated across runs by host, check, and fingerprints. In a scheduled workflow with `permissions: security-events: write`, on a runner that can reach your hosts:
+
+```yaml
+- run: pipx run --spec keywarden-ssh keywarden check --inventory inventory/hosts.ini --allow keys/team.pub --sarif keywarden.sarif || true
+- uses: github/codeql-action/upload-sarif@v4
+  with:
+    sarif_file: keywarden.sarif
+    category: keywarden
+```
+
+`--jsonl` writes one JSON object per line: a `finding` event for every check on every host, and a `key` event for every authorized key with its reach, usage, and last login. Fields are flat (`host`, `code`, `severity`, `fingerprints`, `controls`, and so on), so Splunk, Microsoft Sentinel, and Elastic can ingest the file as-is. Neither output contains key bodies.
+
 ## Evidence for an assessor
 
 ```sh
@@ -248,7 +274,7 @@ python3 -c 'from keywarden.collect import REMOTE_SCRIPT; print(REMOTE_SCRIPT)' |
 - It does not install, rotate, or delete keys.
 - It does not remember a push, a host list, or a report unless you choose `--output`.
 - It does not run on a schedule or keep evidence for you. Run it from cron or CI and keep the reports you want.
-- It checks inventory hosts one at a time, up to 256 per run.
+- It checks up to 2,000 inventory hosts per run, 32 at a time at most.
 - It reads `/etc/passwd` and `~/.ssh/authorized_keys`. Accounts that exist only in LDAP or SSSD, and keys served by `AuthorizedKeysCommand`, are not listed (the command itself is flagged). Their logins still show up in `where`.
 
 ## Tests

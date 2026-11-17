@@ -30,7 +30,7 @@ NAMES = {
     "cis:6.2": "Establish an access revoking process",
     "cis:6.8": "Define and maintain role-based access control",
     "cis:8.2": "Collect audit logs",
-    "cis:8.11": "Conduct audit log reviews",
+    "cis:8.10": "Retain audit logs (at least 90 days)",
     # NIST SP 800-53 Rev. 5
     "nist:AC-2": "Account Management",
     "nist:AC-2(3)": "Account Management | Disable Accounts",
@@ -39,7 +39,7 @@ NAMES = {
     "nist:AC-6(5)": "Least Privilege | Privileged Accounts",
     "nist:AC-17": "Remote Access",
     "nist:AU-2": "Event Logging",
-    "nist:AU-6": "Audit Record Review, Analysis, and Reporting",
+    "nist:AU-11": "Audit Record Retention",
     "nist:AU-12": "Audit Record Generation",
     "nist:CM-6": "Configuration Settings",
     "nist:CM-7": "Least Functionality",
@@ -63,7 +63,7 @@ NAMES = {
     "pci:8.3.1": "User access is authenticated with at least one authentication factor",
     "pci:8.3.6": "Passwords meet minimum complexity",
     "pci:10.2.1": "Audit logs are enabled and active for all system components",
-    "pci:10.4.1": "Audit logs are reviewed at least once daily",
+    "pci:10.5.1": "Audit log history is retained for 12 months, with three months immediately available",
     # NERC CIP
     "cip:CIP-004-7 R4.1": "Authorize electronic access",
     "cip:CIP-004-7 R4.2": "Verify quarterly that individuals with active electronic access have authorization records",
@@ -108,7 +108,7 @@ MAPPING: dict[str, list[str]] = {
     "key-environment": ["cis:4.1", "nist:CM-6", "nist:CM-7", "pci:2.2.1"],
     "expired-key": ["nist:IA-5", "pci:8.2.6"],
     "log-level": ["cis:8.2", "nist:AU-2", "nist:AU-12", "pci:10.2.1", "cip:CIP-007-6 R4.1"],
-    "auth-log": ["cis:8.11", "nist:AU-6", "pci:10.4.1"],
+    "auth-log": ["cis:8.10", "nist:AU-11", "pci:10.5.1"],
     "stale-key": ["cis:5.3", "cis:6.2", "nist:AC-2", "nist:AC-2(3)", "nist:IA-5", "pci:7.2.4", "pci:8.2.6", "cip:CIP-004-7 R4.2", "cip:CIP-004-7 R4.3"],
 }
 

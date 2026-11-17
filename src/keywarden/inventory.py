@@ -102,8 +102,8 @@ def _ancestors(group: str, parents: dict[str, list[str]]) -> list[str]:
 def parse_inventory(text: str, source: str | None = None) -> list[InventoryHost]:
     if _looks_like_yaml(text, source):
         raise ValueError(
-            "only INI inventories are supported in this release. For a YAML inventory, write an INI copy; "
-            "'ansible-inventory -i <file> --list' shows each host and its ansible_* connection vars"
+            "this looks like a YAML inventory. Install Ansible so Keywarden can read it with ansible-inventory, "
+            "or run 'ansible-inventory -i <file> --list > inventory.json' and pass --inventory inventory.json"
         )
     group = "ungrouped"
     kind = "hosts"
@@ -197,3 +197,69 @@ def parse_inventory(text: str, source: str | None = None) -> list[InventoryHost]
             raise ValueError(f"{name} has a private-key path Keywarden cannot pass to ssh")
         hosts.append(InventoryHost(name, address, user, port, identity))
     return hosts
+
+
+def looks_like_yaml(text: str, source: str | None = None) -> bool:
+    return _looks_like_yaml(text, source)
+
+
+def _host_from_vars(name: str, values: dict) -> InventoryHost:
+    chosen: dict[str, str] = {}
+    for key, value in (values or {}).items():
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            _keep(str(key), str(value), chosen)
+    if not _NAME.fullmatch(name):
+        raise ValueError(f"not a hostname: {name}")
+    user = chosen.get("user") or None
+    if user is not None and not _USER.fullmatch(user):
+        raise ValueError(f"{name} has a username that is not usable")
+    address = chosen.get("host", name)
+    if not _NAME.fullmatch(address):
+        raise ValueError(f"{name} has an address that is not usable")
+    port = _port(chosen["port"], name) if chosen.get("port") else None
+    identity = chosen.get("key") or None
+    if identity is not None and (identity.startswith("-") or "{{" in identity):
+        raise ValueError(f"{name} has a private-key path Keywarden cannot pass to ssh")
+    return InventoryHost(name, address, user, port, identity)
+
+
+def parse_inventory_json(text: str) -> list[InventoryHost]:
+    """The output of `ansible-inventory --list`: groups with hosts and children, and _meta.hostvars.
+
+    Ansible has already merged group and host vars into hostvars, so only the
+    connection fields are read from there. Everything else is dropped.
+    """
+    import json
+
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"inventory JSON could not be read: {exc.msg} at line {exc.lineno}") from exc
+    if not isinstance(document, dict):
+        raise ValueError("inventory JSON must be an object, as ansible-inventory --list prints")
+    hostvars = (document.get("_meta") or {}).get("hostvars") or {}
+    order: list[str] = []
+    seen_groups: set[str] = set()
+
+    def walk(group: str, depth: int = 0) -> None:
+        if group in seen_groups or depth > 64:
+            return
+        seen_groups.add(group)
+        body = document.get(group) or {}
+        if not isinstance(body, dict):
+            return
+        for host in body.get("hosts") or []:
+            if isinstance(host, str) and host not in order:
+                order.append(host)
+        for child in body.get("children") or []:
+            if isinstance(child, str):
+                walk(child, depth + 1)
+
+    walk("all")
+    for group in document:
+        if group != "_meta":
+            walk(group)
+    for host in hostvars:
+        if host not in order:
+            order.append(host)
+    return [_host_from_vars(host, hostvars.get(host) or {}) for host in order]

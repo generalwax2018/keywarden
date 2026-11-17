@@ -10,6 +10,7 @@ from keywarden.check import Account, Finding, HostObservation, Login, Policy
 from keywarden.parse import KeyRef
 
 DAY = 86400
+LOG_RETENTION_DAYS = 90
 
 # Groups that are root in all but name.
 ROOT_EQUIVALENT_GROUPS = {"docker", "lxd", "lxc", "disk", "incus-admin"}
@@ -406,14 +407,25 @@ def _usage_findings(host: HostObservation, readable: list[Account], policy: Poli
     findings: list[Finding] = []
     covered_days = int(((host.now or 0) - (host.log_since or host.now or 0)) / DAY)
     source = "the systemd journal (sshd units only)" if host.log_source == "journal" else "syslog files, which any local user can write to"
-    findings.append(
-        Finding(
-            "auth-log",
-            "pass",
-            "sshd logins were read",
-            f"Read {covered_days} day(s) of logins from {source}.",
+    if covered_days < LOG_RETENTION_DAYS:
+        findings.append(
+            Finding(
+                "auth-log",
+                "warn",
+                f"sshd logs go back only {covered_days} day(s)",
+                f"Read {covered_days} day(s) of logins from {source}. Keep at least {LOG_RETENTION_DAYS} days "
+                "on the host or in a log store so key use can be reviewed.",
+            )
         )
-    )
+    else:
+        findings.append(
+            Finding(
+                "auth-log",
+                "pass",
+                "sshd logins were read",
+                f"Read {covered_days} day(s) of logins from {source}.",
+            )
+        )
     stale = []
     unseen = []
     for account in readable:

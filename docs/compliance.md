@@ -1,20 +1,21 @@
 # Compliance mapping
 
-Each Keywarden check is mapped to the framework controls it gives evidence for. The evidence report (`keywarden check --evidence report.html`, or **Evidence** in `keywarden ui`) groups the results by control.
+Each Keywarden check is mapped to the framework controls it gives evidence for. The evidence report (`keywarden check --evidence report.html`, or **Evidence** in `keywarden ui`) groups the results by control, and every finding in the JSON, SARIF, and JSON Lines output carries its control IDs.
 
 This mapping is meant to help an assessment, not replace one:
 
 - A passing check is evidence toward a control on the hosts that were checked. It does not show the control is met. Most controls also cover process, people, and systems a host scan cannot see.
 - Keywarden makes no MFA claim. Turning passwords off is not the same as requiring a second factor.
 - Requirement names in the report are paraphrased. Read the framework for the exact wording.
-- Versions: CIS Controls v8 safeguards, NIST SP 800-53 Rev. 5, PCI DSS v4.0, and NERC CIP-004-7, CIP-005-7, and CIP-007-6.
 
-Corrections are welcome: open an issue with the check, the control, and why.
+## Versions
+
+CIS Controls v8 safeguards, NIST SP 800-53 Rev. 5, PCI DSS v4.0, and NERC CIP-004-7, CIP-005-7, and CIP-007-6.
 
 | Check | CIS Controls v8 | NIST SP 800-53 Rev. 5 | PCI DSS v4.0 | NERC CIP |
 | --- | --- | --- | --- | --- |
 | `accepted-algorithms` | 3.10 | SC-13 | 2.2.7 | CIP-005-7 R2.2 |
-| `auth-log` | 8.11 | AU-6 | 10.4.1 | – |
+| `auth-log` | 8.10 | AU-11 | 10.5.1 | – |
 | `auth-methods` | 4.1 | IA-2, IA-5(1) | 8.3.1 | CIP-007-6 R5.1 |
 | `authorized-keys-command` | 4.1 | AC-2, CM-6 | 2.2.1 | – |
 | `authorized-keys-file` | 4.1 | CM-6 | 2.2.1 | – |
@@ -45,3 +46,12 @@ Corrections are welcome: open an issue with the check, the control, and why.
 | `weak-algorithm` | 3.10 | IA-5(2), SC-13 | 2.2.7 | CIP-005-7 R2.2 |
 
 The table is generated from `src/keywarden/controls.py`, and a test fails if the two disagree.
+
+## How the mapping was checked
+
+Every control ID and title was checked against the framework text for the versions above, and each mapping was kept only where the check produces evidence the control actually asks for. That review changed some mappings in 0.4.0:
+
+- **Removed:** CIS 6.5 and PCI DSS 8.4.2 (MFA). A host scan can show passwords are off, not that a second factor is required.
+- **Changed:** `auth-log` now checks how far back sshd's login log goes (warns under 90 days) and maps to log retention (CIS 8.10, NIST AU-11, PCI DSS 10.5.1). It used to map to log review (CIS 8.11, NIST AU-6, PCI DSS 10.4.1), which is a process a scan cannot show.
+
+The mapping has been reviewed by the maintainer, not yet by an independent assessor. If you assess against one of these frameworks and something reads wrong, please open a **Compliance mapping correction** issue with the check, the control, and why. Corrections are credited in the changelog.
