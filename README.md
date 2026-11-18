@@ -21,7 +21,7 @@ Your browser opens Keywarden. Press **Use Lab Keys**, then **Run Checks**, to se
 
 ## Install
 
-Python 3.9 or newer. No third-party packages. `--local` needs Linux or another POSIX system; the browser UI, `--host`, and `--inventory` also run on Windows using its built-in `ssh`.
+Python 3.9 or newer. No third-party packages. Keywarden checks Linux, macOS, and FreeBSD servers. `--local` needs a POSIX system; the browser UI, `--host`, and `--inventory` also run on Windows using its built-in `ssh`. There is also a [container image](#github-action-and-container) and a [GitHub Action](#github-action-and-container).
 
 ```sh
 python3 -m pip install keywarden-ssh
@@ -30,7 +30,7 @@ python3 -m pip install keywarden-ssh
 Or straight from a tag:
 
 ```sh
-python3 -m pip install "git+https://github.com/generalwax2018/keywarden.git@v0.4.0"
+python3 -m pip install "git+https://github.com/generalwax2018/keywarden.git@v0.5.0"
 ```
 
 The distribution name is `keywarden-ssh`. The `keywarden` package on PyPI is an unrelated project; do not install it expecting this tool.
@@ -49,7 +49,7 @@ PYTHONPATH=src python3 -m keywarden --version
 keywarden ui
 ```
 
-This opens Keywarden in a browser tab, served from your machine. Paste the public keys you push, choose what to check (this machine, one host, an Ansible inventory, or collector output you paste), and run. Results show failing hosts first, with the access review table and a "find a key" search beside them. Export the findings as JSON or the key table as CSV. Press **Fill lab keys** and **Run checks** to try it on six made-up hosts first.
+This opens Keywarden in a browser tab, served from your machine. Paste the public keys you push, choose what to check (this machine, one host, an Ansible inventory, or collector output you paste), and run. Results show failing hosts first, with the access review table and a "find a key" search beside them. Export the findings as JSON or the key table as CSV. Press **Use Lab Keys** and **Run Checks** to try it on six made-up hosts first; the lab also loads example owners and two leavers, so the **Access Review** tab shows names and the sign-off.
 
 The server listens on `127.0.0.1` only, on port 8765 (or any free port if that one is taken), and the link it prints carries a one-time token. It refuses requests without that token, from another web page, or with a Host header other than localhost, so a site you visit cannot drive it. The page loads nothing from the internet. Key text is fingerprinted on arrival and cleared from the box; the tab holds fingerprints only. Use `--port` to pick the port and `--no-browser` to print the link without opening it.
 
@@ -103,7 +103,7 @@ keywarden check --inventory hosts.ini --allow team.pub
 
 From an INI file, Keywarden reads `ansible_user`, `ansible_host`, `ansible_port`, and `ansible_ssh_private_key_file` (and their `ansible_ssh_*` spellings), from host lines, `[group:vars]`, and parent groups through `[group:children]`. A nearer group overrides a parent, and a host line overrides both, as in Ansible. A private-key path is handed to `ssh -i`; Keywarden never opens the file. Passwords, become passwords, and every other variable are dropped as the file is read. From JSON, Ansible has already merged those variables into each host. Hosts are checked eight at a time by default (`--jobs 1` to `--jobs 32`), each over its own SSH session, and reported in inventory order. A host that cannot be reached is a failure, and the rest are still checked.
 
-The terminal shows failures only. A check that names a key is printed once per fingerprint, with every host where that fingerprint failed. Other failures stay on their own line: hostname and check. Passes are not printed. Exit 1 if any host failed. `--output` writes the JSON report, still without key bodies. The `fingerprints` array is the unique set. `--prior` is for one host, not an inventory.
+The terminal shows failures only. A check that names a key is printed once per fingerprint, with every host where that fingerprint failed. Other failures stay on their own line: hostname and check. Passes are not printed. Exit 1 if any host failed. `--output` writes the JSON report, still without key bodies. The `fingerprints` array is the unique set. `--prior` takes the previous report from the same inventory, and marks drift host by host.
 
 ```ini
 [web]
@@ -127,11 +127,12 @@ There is no scheduler. The next run is the next time you start the command.
 | `permissions` | `.ssh` or `authorized_keys` is group- or world-accessible |
 | `weak-algorithm` | DSA, or RSA under 3072 bits |
 | `outside-push` | a non-root key is not in `--allow` |
-| `cert-authority` | a line is marked `cert-authority` |
-| `ssh-certificate` | a certificate is expired, not yet valid, a host certificate, or unreadable |
+| `cert-authority` | a line is marked `cert-authority`, unless that CA is in `--allow-ca` |
+| `ssh-certificate` | a certificate is expired, not yet valid, a host certificate, unreadable, or signed by a CA not in `--allow-ca`. A warning when it is valid for longer than `--max-cert-days` (default 90), never expires, or names no principals. |
+| `host-certificate` | the host's own certificate (`HostCertificate`) has expired or is signed by a CA not in `--allow-ca`. A warning when it never expires or expires within 14 days. |
 | `accepted-algorithms` | `PubkeyAcceptedAlgorithms` still allows `ssh-rsa`, `ssh-dss`, or SHA-1 |
 | `ca-algorithms` | `CASignatureAlgorithms` still allows those |
-| `trusted-user-ca` | `TrustedUserCAKeys` is set, so a signed key can bypass the push |
+| `trusted-user-ca` | `TrustedUserCAKeys` is set, so a signed key can bypass the push. With `--allow-ca`, it passes when every CA in that file is approved. |
 | `revoked-keys` | a user CA is trusted and `RevokedKeys` is none (warning) |
 | `authorized-keys-command` | a command can inject keys that are not in the file |
 | `authorized-keys-file` | `sshd` also reads a path other than `.ssh/authorized_keys` |
@@ -149,6 +150,9 @@ There is no scheduler. The next run is the next time you start the command.
 | `log-level` | `LogLevel` is `QUIET`, `FATAL`, or `ERROR`, so logins are not recorded |
 | `auth-log` | the sshd log could not be read, so key usage was not checked (warning) |
 | `stale-key` | an authorized key has no login in `--stale-days` (default 90). A warning when the logs are shorter than that. |
+| `leaver-key` | with `--owners` and `--leavers`: a key belonging to someone who has left is still authorized |
+| `key-owner` | with `--owners`: a key matches nobody in the owners file (warning) |
+| `jump-host` | with `--require-jump`: Keywarden reached the host directly rather than through a jump host |
 
 Fields that are absent from the observation are skipped, not treated as a pass.
 
@@ -188,6 +192,81 @@ Each `sudo -l -U` call is written to the host's auth log by sudo itself.
 
 Only the newest login line and a count per account and key leave the host. Pass `--redact-addresses` to drop the last login address from the output.
 
+## Who owns each key, and who has left
+
+A fingerprint is not an answer to "who can get in". Give Keywarden an owners file and every key gets a name:
+
+```sh
+keywarden check --inventory hosts.ini --owners owners.csv --leavers leavers.txt --keys
+```
+
+```csv
+owner,email,github,fingerprint,status
+Dana Ortiz,dana@example.com,dortiz,SHA256:i9/X7kZqpISKANQXHxfPGg8U32ooosWg6S4XoO75GPM,
+Jordan Pike,jordan@example.com,,SHA256:Bp52GaHcgigUoEWMzWgfUk/2Rnaw5UXCf06Srz7c35M,terminated
+```
+
+`--owners` reads:
+
+- **CSV** with an `owner` column and a `fingerprint` or `key` column (a public key line). Optional `email`, `github`, and `status`; a status of `left`, `terminated`, `disabled`, or `offboarded` marks a leaver.
+- **JSON**: `{"owners": [{"name": ..., "email": ..., "github": ..., "fingerprints": [...], "keys": [...]}]}`.
+- **LDIF** from your directory: `ldapsearch -LLL '(objectClass=ldapPublicKey)' uid mail sshPublicKey > people.ldif`.
+- **A directory** of `<person>.pub` files, the layout many teams already keep in their Ansible repo.
+- **GitHub**: a `github` username fetches `https://github.com/<user>.keys` (`--no-github` to skip).
+
+Keys are fingerprinted as they are read and the bodies dropped. `--leavers` is one name, email, or GitHub username per line, the shape of an HR export. Any of their keys still authorized anywhere fails `leaver-key`, and a leaver with no keys on file is printed on stderr, because Keywarden cannot sweep keys it does not know about. Keys that match nobody warn as `key-owner`.
+
+The access review table gains an `owner` column, the JSON report an `owners` summary (hosts, accounts, keys, and root reach per person), and the terminal a **who has access** list with leavers first.
+
+## Sign off a review
+
+A quarterly access review (PCI DSS 7.2.4, NERC CIP-004 R4.2 and R4.3) is a person deciding, key by key, that access is still right. In `keywarden ui`, open **Access Review**, mark each key **Approve** or **Revoke** with a note, enter your name, and press **Sign Off**. You get two files:
+
+- `keywarden-review-<date>.json`: the decisions with owner, reach, and last use for each key, the reviewer, the SHA-256 of the report reviewed, and a SHA-256 seal over the record.
+- `keywarden-review-<date>.html`: the same, for the auditor.
+
+Add your SSH signature, and let anyone check it:
+
+```sh
+keywarden review sign keywarden-review-2026-11-18.json --key ~/.ssh/id_ed25519
+keywarden review verify keywarden-review-2026-11-18.json --signers allowed_signers
+```
+
+Signing uses `ssh-keygen -Y sign` with the namespace `keywarden-review`; Keywarden never reads your private key. `verify` fails if a decision was changed after sealing, or if the signature does not match. Without the GUI, `keywarden review record report.json decisions.csv --reviewer "Dana Ortiz" --output review.json` seals decisions from a CSV (`host,account,fingerprint,decision,note`).
+
+## Fix plan
+
+Keywarden does not change hosts. It writes the change for you to review:
+
+```sh
+keywarden check --inventory hosts.ini --owners owners.csv --leavers leavers.txt --fix-plan keywarden-fix.yml
+keywarden plan report.json --review keywarden-review-2026-11-18.json --output keywarden-fix.yml
+```
+
+The playbook removes keys by fingerprint: on each host, `ssh-keygen -lf` fingerprints every `authorized_keys` line and drops the matches, so no key body is in the playbook. `--fix-for` picks what goes in: `leaver`, `outside` (not in `--allow`), `stale`, `unowned`, `expired` (default `leaver,outside`); with `--review`, the keys marked **Revoke**. **Fix Plan** in the GUI does the same from your decisions.
+
+```sh
+ansible-playbook -i hosts.ini keywarden-fix.yml                         # dry run: lists what matches
+ansible-playbook -i hosts.ini keywarden-fix.yml -e keywarden_apply=true  # removes, after a backup
+```
+
+Each file is backed up as `authorized_keys.keywarden-<time>` before it is rewritten, with its owner and mode kept.
+
+## Alerts
+
+```sh
+keywarden check --inventory hosts.ini --allow team.pub --prior last.json --output last.json \
+  --notify "$SLACK_WEBHOOK"
+```
+
+`--notify` posts a short summary when something changed since `--prior` (new or regressed findings, new keys): host, check, and fingerprints, never comments or login addresses. `--notify-on fail` posts whenever a host fails, and `always` on every run. The message shape follows the URL (Slack, Discord, Teams workflow) or `--notify-format`; anything else gets plain JSON. Set `KEYWARDEN_WEBHOOK` instead of passing the URL on the command line. Only `https://` URLs are accepted, plus `http://localhost` for testing.
+
+## Certificates and jump hosts
+
+`--allow-ca ca.pub` (repeatable) lists the user and host CAs you run. With it, `trusted-user-ca` compares the keys in sshd's `TrustedUserCAKeys` file with that list instead of failing whenever a CA is trusted; `cert-authority` lines and certificates in `authorized_keys` pass only when their CA is listed; and the host's own `HostCertificate` is checked for an approved signer and an end date. Certificates valid for longer than `--max-cert-days` (default 90), or forever, warn.
+
+Hosts behind a bastion are reached the way Ansible reaches them: `ansible_ssh_common_args` with `-J`, `-o ProxyJump=`, or `-o ProxyCommand="ssh -W %h:%p bastion"`, or a `ProxyJump` in `~/.ssh/config`. `--jump` does the same for `--host`. Each host's report says how it was reached (`accessPath`). With `--require-jump`, a host Keywarden reached directly fails `jump-host`: evidence for NERC CIP-005 R2.1, if your rule is that interactive access goes through an intermediate system.
+
 ## Pipelines and SIEM
 
 ```sh
@@ -205,6 +284,46 @@ keywarden check --inventory hosts.ini --allow team.pub --sarif keywarden.sarif -
 ```
 
 `--jsonl` writes one JSON object per line: a `finding` event for every check on every host, and a `key` event for every authorized key with its reach, usage, and last login. Fields are flat (`host`, `code`, `severity`, `fingerprints`, `controls`, and so on), so Splunk, Microsoft Sentinel, and Elastic can ingest the file as-is. Neither output contains key bodies.
+
+## GitHub Action and container
+
+The repository is a GitHub Action. On a self-hosted runner that can reach your hosts:
+
+```yaml
+permissions:
+  contents: read
+  security-events: write
+steps:
+  - uses: actions/checkout@v7
+  - uses: generalwax2018/keywarden@v0.5.0
+    with:
+      inventory: inventory/hosts.ini
+      allow: keys/team.pub
+      owners: keys/owners.csv
+      args: --require-jump --stale-days 60
+```
+
+It installs Keywarden from the tag you pin, runs the check, and uploads the SARIF to code scanning. Outputs: `sarif` and `exit-code`. Set `fail-on-findings: "true"` to fail the job when a host fails.
+
+Or run the container, which has `ssh` and runs as a non-root user:
+
+```sh
+docker build -t keywarden .
+docker run --rm -v "$PWD:/work" -v "$HOME/.ssh:/home/keywarden/.ssh:ro" keywarden \
+  check --inventory hosts.ini --allow team.pub --sarif keywarden.sarif
+```
+
+`--build-arg ANSIBLE=1` adds `ansible-core` for YAML and dynamic inventories.
+
+## Verify a release
+
+Releases are built and published by GitHub Actions from a tag, with no stored PyPI token. Each release has:
+
+- PyPI attestations (PEP 740), shown on the PyPI project page.
+- A GitHub build-provenance attestation: `gh attestation verify keywarden_ssh-0.5.0-py3-none-any.whl --repo generalwax2018/keywarden`.
+- The wheel, the source archive, and `SHA256SUMS` on the GitHub release.
+
+The repository's own practices are scored weekly by [OpenSSF Scorecard](https://securityscorecards.dev/viewer/?uri=github.com/generalwax2018/keywarden).
 
 ## Evidence for an assessor
 
@@ -263,7 +382,7 @@ A check that was a pass and is now a fail is marked `regressed`. A new failure i
 
 ## Offline observation
 
-If you would rather not have Keywarden open SSH itself, run the collector on the host and pipe it. Do not save that stream: it contains public keys. The report does not. Collector output from 0.1.0 (protocol 1) is refused; run the current collector.
+If you would rather not have Keywarden open SSH itself, run the collector on the host and pipe it. Do not save that stream: it contains public keys. The report does not. Collector output from 0.1.0 (protocol 1) is refused; run the current collector. Output from 0.2.0 to 0.4.0 still reads, without the certificate files that `trusted-user-ca` and `host-certificate` compare.
 
 ```sh
 python3 -c 'from keywarden.collect import REMOTE_SCRIPT; print(REMOTE_SCRIPT)' | sh | keywarden check --observation - --allow team.pub
@@ -271,11 +390,11 @@ python3 -c 'from keywarden.collect import REMOTE_SCRIPT; print(REMOTE_SCRIPT)' |
 
 ## What this release does not do
 
-- It does not install, rotate, or delete keys.
+- It does not install, rotate, or delete keys itself. A fix plan is a playbook you review and run.
 - It does not remember a push, a host list, or a report unless you choose `--output`.
-- It does not run on a schedule or keep evidence for you. Run it from cron or CI and keep the reports you want.
+- It does not run on a schedule or keep evidence for you. Run it from cron, CI, or the GitHub Action, and keep the reports and review records you want.
 - It checks up to 2,000 inventory hosts per run, 32 at a time at most.
-- It reads `/etc/passwd` and `~/.ssh/authorized_keys`. Accounts that exist only in LDAP or SSSD, and keys served by `AuthorizedKeysCommand`, are not listed (the command itself is flagged). Their logins still show up in `where`.
+- It reads `/etc/passwd` (Directory Services on macOS) and `~/.ssh/authorized_keys`. Accounts that exist only in LDAP or SSSD, and keys served by `AuthorizedKeysCommand`, are not listed (the command itself is flagged). Their logins still show up in `where`.
 
 ## Tests
 
@@ -283,7 +402,7 @@ python3 -c 'from keywarden.collect import REMOTE_SCRIPT; print(REMOTE_SCRIPT)' |
 python3 -m unittest discover -s tests -v
 ```
 
-Fingerprint and certificate tests run when `ssh-keygen` is installed and are skipped otherwise. CI also runs the collector against a real OpenSSH server, including an `authorized_keys` file that tries to rewrite the report.
+Fingerprint and certificate tests run when `ssh-keygen` is installed and are skipped otherwise. CI runs the tests on Linux (Python 3.9 to 3.13), Windows, and macOS; runs the collector against a real OpenSSH server, including an `authorized_keys` file that tries to rewrite the report; runs the collector on a real Mac and a FreeBSD VM; builds the container; and runs the GitHub Action.
 
 ## Contributing
 

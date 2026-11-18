@@ -229,6 +229,22 @@ td.fp, td.mono { font-family: var(--mono); font-size: 12px; }
 }
 .legal { color: var(--tertiary); font-size: 11.5px; padding: 0 10px; margin: 0; }
 .legal .btn.plain { font-size: 11.5px; padding: 0; }
+.signoff { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; justify-content: space-between; padding: 10px 14px; border-radius: 14px; background: var(--glass); backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur); box-shadow: inset 0 1px 0 var(--glass-shine), 0 0 0 .5px var(--glass-edge), var(--shadow); }
+.signoff .who { display: flex; gap: 8px; flex-wrap: wrap; }
+.signoff .who input { width: 170px; }
+.signoff .tally, .signoff .acts { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.people { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 13px; padding: 2px 4px; }
+.people > b { font-weight: 600; margin-right: 4px; }
+.person { display: inline-flex; gap: 6px; align-items: baseline; padding: 5px 10px; border-radius: 10px; background: var(--glass-soft); box-shadow: 0 0 0 .5px var(--glass-edge); }
+.person small { color: var(--secondary); font-size: 12px; }
+.person.left { box-shadow: 0 0 0 1px color-mix(in srgb, var(--red) 45%, transparent); }
+.decide { display: grid; gap: 4px; min-width: 150px; }
+.segs { display: inline-flex; border-radius: 8px; padding: 2px; background: var(--fill); width: max-content; }
+.seg { border: 0; background: transparent; color: var(--secondary); font: inherit; font-size: 12px; font-weight: 600; padding: 3px 9px; border-radius: 6px; cursor: pointer; }
+.seg.yes.on { background: color-mix(in srgb, var(--green) 22%, transparent); color: var(--green-text); }
+.seg.no.on { background: color-mix(in srgb, var(--red) 20%, transparent); color: var(--red-text); }
+.decide .note { font-size: 12px; padding: 3px 6px; }
+tr.revoked td:not(:first-child) { opacity: .55; text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--red) 60%, transparent); }
 .changes { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; padding: 10px 14px; border-radius: 14px; font-size: 13px; }
 .changes b { font-weight: 600; }
 .chg { display: inline-flex; gap: 6px; align-items: center; }
@@ -304,6 +320,16 @@ td.fp, td.mono { font-family: var(--mono); font-size: 12px; }
       </div>
     </section>
 
+    <section class="group" aria-labelledby="people-title">
+      <div class="group-title"><span id="people-title">People and certificates</span><span>Session only</span></div>
+      <div class="card">
+        <div class="field"><label for="owners-file">Key owners</label><input type="file" id="owners-file" accept=".csv,.json,.ldif,text/csv,application/json"><small>CSV, JSON, or LDIF mapping people to keys. Names each key in the review.</small></div>
+        <div class="field"><label for="leavers-file">Leavers</label><input type="file" id="leavers-file" accept=".csv,.txt,text/plain,text/csv"><small>One name, email, or GitHub user per line. Their keys fail.</small></div>
+        <div class="field"><label for="ca-file">Approved CAs</label><input type="file" id="ca-file" accept=".pub,text/plain" multiple><small>User and host CA public keys you run.</small></div>
+        <label class="option"><span class="text"><span>Require a jump host</span><small>Fail hosts reached directly</small></span><input type="checkbox" id="require-jump"></label>
+      </div>
+    </section>
+
     <section class="group">
       <div class="group-title"><span>Offline</span></div>
       <details class="card" id="paste-panel">
@@ -311,7 +337,7 @@ td.fp, td.mono { font-family: var(--mono); font-size: 12px; }
         <div class="inside">
           <p class="help">Run the collector on the host and paste what it prints. Don't save that output; it contains public keys.</p>
           <button class="btn" id="copy-collector" type="button">Copy Collector Script</button>
-          <textarea id="observation" aria-label="Collector output" spellcheck="false" autocomplete="off" placeholder="KEYWARDEN 3&#10;HOST …"></textarea>
+          <textarea id="observation" aria-label="Collector output" spellcheck="false" autocomplete="off" placeholder="KEYWARDEN 4&#10;HOST …"></textarea>
           <button class="btn primary" id="run-paste" type="button">Check Paste</button>
         </div>
       </details>
@@ -352,7 +378,7 @@ const LOCAL_OK = __LOCAL_OK__;
 history.replaceState(null, "", "/");
 
 const $ = (id) => document.getElementById(id);
-const state = { push: [], lab: false, report: null, csv: "", evidence: "", filter: "work", view: "findings", sort: { key: "host", dir: 1 }, onlyRoot: false, onlyStale: false, prior: null, busy: false };
+const state = { decisions: {}, reviewer: { name: "", role: "" }, onlyOpen: false, ownersText: "", leaversText: "", caText: "", push: [], lab: false, report: null, csv: "", evidence: "", filter: "work", view: "findings", sort: { key: "host", dir: 1 }, onlyRoot: false, onlyStale: false, prior: null, busy: false };
 
 // Build elements with text nodes only. Values from hosts never reach innerHTML.
 function h(tag, attrs, ...kids) {
@@ -401,17 +427,19 @@ const STORE = { settings: "keywarden.settings.v1", previous: "keywarden.previous
 function load(key, fallback) { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } }
 function save(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* private window or storage off */ } }
 const SETTING_FIELDS = ["host", "inventory", "stale", "jobs", "accounts", "waivers"];
-const SETTING_SWITCHES = ["flag-outside", "flag-weak"];
+const SETTING_SWITCHES = ["flag-outside", "flag-weak", "require-jump"];
 function saveSettings() {
   const data = { target: selectedTarget() };
   for (const id of SETTING_FIELDS) data[id] = $(id).value;
   for (const id of SETTING_SWITCHES) data[id] = $(id).checked;
+  data.reviewer = { name: String(state.reviewer.name || ""), role: String(state.reviewer.role || "") };
   save(STORE.settings, data);
 }
 function restoreSettings() {
   const data = load(STORE.settings, null);
   if (!data) return;
   for (const id of SETTING_FIELDS) if (typeof data[id] === "string") $(id).value = data[id];
+  if (data.reviewer && typeof data.reviewer === "object") state.reviewer = { name: String(data.reviewer.name || ""), role: String(data.reviewer.role || "") };
   for (const id of SETTING_SWITCHES) if (typeof data[id] === "boolean") $(id).checked = data[id];
   const radio = document.querySelector(`input[name="target"][value="${CSS.escape(String(data.target || "lab"))}"]`);
   if (radio && !(radio.value === "local" && !LOCAL_OK)) radio.checked = true;
@@ -468,6 +496,10 @@ async function runCheck(target) {
     staleDays: parseInt($("stale").value, 10) || 90,
     waiversPath: $("waivers").value.trim(),
     prior: state.prior,
+    ownersText: state.ownersText,
+    leaversText: state.leaversText,
+    allowCaText: state.caText,
+    requireJump: $("require-jump").checked,
   });
   const previous = target === "lab" ? {} : load(STORE.previous, {});
   body.previous = previous;
@@ -479,7 +511,7 @@ async function runCheck(target) {
   setBusy(true, target === "inventory" ? " Checking hosts…" : " Checking…");
   try {
     const data = await api("/api/check", body);
-    state.report = data.report; state.csv = data.csv; state.evidence = data.evidence;
+    state.report = data.report; state.csv = data.csv; state.evidence = data.evidence; state.decisions = {};
     state.push = (data.report.push || []).map((k) => ({ fingerprint: k.fingerprint, type: k.type, bits: k.bits, comment: k.comment }));
     state.lab = data.lab;
     $("export-json").disabled = false; $("export-csv").disabled = false; $("export-evidence").disabled = false;
@@ -598,36 +630,127 @@ function renderFindings() {
     : h("div", { class: "empty" }, h("b", {}, state.filter === "work" ? "Every host passed" : "No host passed every check yet")));
 }
 
-const COLUMNS = [["host", "Host"], ["account", "Account"], ["fingerprint", "Fingerprint"], ["reach", "Reach"], ["usage", "Usage"], ["lastUsed", "Last Used"], ["from", "From"], ["inAllow", "In Push"], ["comment", "Comment"]];
+const BASE_COLUMNS = [["host", "Host"], ["account", "Account"], ["fingerprint", "Fingerprint"], ["owner", "Owner"], ["reach", "Reach"], ["usage", "Usage"], ["lastUsed", "Last Used"], ["from", "From"], ["inAllow", "In Push"], ["comment", "Comment"]];
+const rowKey = (row) => `${row.host}|${row.account}|${row.fingerprint}`;
 function cell(row, key) {
   if (key === "from") return (row.options.from || []).join(", ") || "Any";
   if (key === "inAllow") return row.inAllow == null ? "–" : row.inAllow ? "Yes" : "No";
   if (key === "lastUsed") return row.lastUsed ? row.lastUsed.slice(0, 10) : "–";
+  if (key === "owner") return row.owner ? row.owner + (row.ownerLeft ? " (left)" : "") : "–";
   return row[key] == null || row[key] === "" ? "–" : String(row[key]);
+}
+function decisionCounts(rows) {
+  let approved = 0, revoked = 0;
+  for (const row of rows) { const d = state.decisions[rowKey(row)]; if (d?.decision === "approve") approved++; if (d?.decision === "revoke") revoked++; }
+  return { approved, revoked, open: rows.length - approved - revoked };
+}
+function setDecision(row, decision) {
+  const key = rowKey(row);
+  const note = state.decisions[key]?.note || "";
+  if (decision) state.decisions[key] = { decision, note }; else delete state.decisions[key];
+}
+function signoffBar(allRows) {
+  const counts = decisionCounts(allRows);
+  const remaining = allRows.filter((r) => !state.decisions[rowKey(r)]);
+  const anyLeaver = allRows.some((r) => r.ownerLeft);
+  return h("div", { class: "signoff" },
+    h("div", { class: "who" },
+      h("input", { type: "text", id: "reviewer", placeholder: "Reviewer name", "aria-label": "Reviewer name", value: state.reviewer.name, autocomplete: "name",
+        oninput: (e) => { state.reviewer.name = e.target.value; saveSettings(); } }),
+      h("input", { type: "text", id: "reviewer-role", placeholder: "Role", "aria-label": "Reviewer role", value: state.reviewer.role,
+        oninput: (e) => { state.reviewer.role = e.target.value; saveSettings(); } })),
+    h("div", { class: "tally" },
+      h("span", { class: "pill ok" }, `${counts.approved} approved`), h("span", { class: "pill bad" }, `${counts.revoked} revoked`), h("span", { class: "pill" }, `${counts.open} open`)),
+    h("div", { class: "acts" },
+      h("button", { class: "btn", type: "button", disabled: !remaining.length, title: "Approve every key you have not decided on",
+        onclick: () => { remaining.forEach((r) => setDecision(r, "approve")); renderReview(); } }, "Approve Rest"),
+      h("button", { class: "btn", type: "button", id: "fix-plan", disabled: !counts.revoked && !anyLeaver,
+        title: "Download an Ansible playbook that removes revoked and leaver keys. Keywarden does not run it.", onclick: exportFixPlan }, "Fix Plan"),
+      h("button", { class: "btn primary", type: "button", id: "sign-off", disabled: !(counts.approved + counts.revoked),
+        title: "Seal the decisions into a review record (JSON and HTML)", onclick: exportReview }, "Sign Off")));
+}
+function decisionCell(row) {
+  const key = rowKey(row);
+  const current = state.decisions[key]?.decision || "";
+  const choice = (value, label, cls) => h("button", { type: "button", class: "seg " + cls + (current === value ? " on" : ""), "aria-pressed": String(current === value),
+    onclick: () => { setDecision(row, current === value ? "" : value); renderReview(); } }, label);
+  return h("div", { class: "decide" },
+    h("div", { class: "segs", role: "group", "aria-label": "Decision" }, choice("approve", "Approve", "yes"), choice("revoke", "Revoke", "no")),
+    current ? h("input", { type: "text", class: "note", placeholder: "Note", "aria-label": "Note", value: state.decisions[key]?.note || "",
+      oninput: (e) => { if (state.decisions[key]) state.decisions[key].note = e.target.value; } }) : "");
+}
+function ownersPanel() {
+  const people = state.report.owners || [];
+  if (!people.length) return "";
+  return h("div", { class: "people" }, h("b", {}, "Who has access"),
+    people.slice(0, 12).map((p) => h("span", { class: "person" + (p.left ? " left" : "") },
+      h("strong", {}, p.owner), p.left ? h("span", { class: "pill bad" }, "left") : "",
+      h("small", {}, `${p.hosts} host${p.hosts === 1 ? "" : "s"}${p.rootHosts ? " · root on " + p.rootHosts : ""} · ${p.keys.length} key${p.keys.length === 1 ? "" : "s"}`))));
 }
 function renderReview() {
   const view = $("view-review");
   if (!state.report) { view.replaceChildren(emptyState()); return; }
-  let rows = state.report.hosts.flatMap((host) => host.keys || []);
+  const allRows = state.report.hosts.flatMap((host) => host.keys || []);
+  const hasOwners = allRows.some((r) => "owner" in r);
+  const COLUMNS = BASE_COLUMNS.filter(([k]) => k !== "owner" || hasOwners);
+  let rows = allRows;
   if (state.onlyRoot) rows = rows.filter((r) => r.reach === "root" || r.reach === "root-nopasswd");
   if (state.onlyStale) rows = rows.filter((r) => r.usage === "stale");
+  if (state.onlyOpen) rows = rows.filter((r) => !state.decisions[rowKey(r)]);
   const { key, dir } = state.sort;
   rows = [...rows].sort((a, b) => cell(a, key).localeCompare(cell(b, key), undefined, { numeric: true }) * dir);
   const toggle = (id, label, value, set) => h("label", { class: "option" }, h("span", {}, label), h("input", { type: "checkbox", id, checked: value, onchange: (e) => { set(e.target.checked); renderReview(); } }));
   const tools = h("div", { class: "table-tools" },
     toggle("only-root", "Only keys that reach root", state.onlyRoot, (v) => { state.onlyRoot = v; }),
     toggle("only-stale", "Only stale keys", state.onlyStale, (v) => { state.onlyStale = v; }),
+    toggle("only-open", "Only undecided", state.onlyOpen, (v) => { state.onlyOpen = v; }),
     h("span", {}, `${rows.length} key${rows.length === 1 ? "" : "s"}`));
-  const pillFor = (k, v) => {
+  const pillFor = (k, v, row) => {
     if (k === "reach") return h("span", { class: "pill " + (v === "root" || v === "root-nopasswd" ? "bad" : v === "root-password" ? "warnp" : "") }, v);
     if (k === "usage") return h("span", { class: "pill " + (v === "stale" ? "bad" : v === "fresh" ? "ok" : "warnp") }, v);
+    if (k === "owner" && row.ownerLeft) return h("span", { class: "pill bad" }, v);
+    if (k === "owner" && !row.owner) return h("span", { class: "pill warnp" }, "unknown");
     return v;
   };
   const table = h("table", {},
-    h("thead", {}, h("tr", {}, COLUMNS.map(([k, label]) => h("th", { scope: "col", "aria-sort": key === k ? (dir > 0 ? "ascending" : "descending") : "none" },
+    h("thead", {}, h("tr", {}, h("th", { scope: "col" }, "Decision"), COLUMNS.map(([k, label]) => h("th", { scope: "col", "aria-sort": key === k ? (dir > 0 ? "ascending" : "descending") : "none" },
       h("button", { type: "button", onclick: () => { state.sort = { key: k, dir: state.sort.key === k ? -state.sort.dir : 1 }; renderReview(); } }, label + (key === k ? (dir > 0 ? " ▲" : " ▼") : "")))))),
-    h("tbody", {}, rows.map((row) => h("tr", {}, COLUMNS.map(([k]) => h("td", { class: k === "fingerprint" ? "fp" : (k === "from" || k === "lastUsed" ? "mono" : "") }, pillFor(k, cell(row, k))))))));
-  view.replaceChildren(h("div", { class: "hosts" }, tools, h("div", { class: "table-wrap" }, table)));
+    h("tbody", {}, rows.map((row) => h("tr", { class: state.decisions[rowKey(row)]?.decision === "revoke" ? "revoked" : "" },
+      h("td", {}, decisionCell(row)),
+      COLUMNS.map(([k]) => h("td", { class: k === "fingerprint" ? "fp" : (k === "from" || k === "lastUsed" ? "mono" : "") }, pillFor(k, cell(row, k), row)))))));
+  view.replaceChildren(h("div", { class: "hosts" }, ownersPanel(), signoffBar(allRows), tools, h("div", { class: "table-wrap" }, table)));
+}
+function decisionList() {
+  return Object.entries(state.decisions).map(([key, value]) => {
+    const [host, account, fingerprint] = key.split("|");
+    return { host, account, fingerprint, decision: value.decision, note: value.note || "" };
+  });
+}
+async function exportReview() {
+  showError("");
+  if (!state.reviewer.name.trim()) { showError("Add the reviewer's name before signing off."); $("reviewer")?.focus(); return; }
+  try {
+    const data = await api("/api/review", { report: state.report, reviewer: state.reviewer, decisions: decisionList() });
+    download(`keywarden-review-${stamp()}.json`, "application/json", JSON.stringify(data.record, null, 2) + "\n");
+    download(`keywarden-review-${stamp()}.html`, "text/html", data.html);
+    showInfo(`Review sealed (SHA-256 ${data.record.sha256.slice(0, 12)}…). To sign it: keywarden review sign <file> --key ~/.ssh/id_ed25519`);
+  } catch (error) { showError(error.message); }
+}
+async function exportFixPlan() {
+  showError("");
+  try {
+    const data = await api("/api/fixplan", { report: state.report, decisions: decisionList() });
+    download(`keywarden-fix-${stamp()}.yml`, "text/yaml", data.playbook);
+    showInfo(`The fix plan covers ${data.count} key${data.count === 1 ? "" : "s"}. Dry run it first: ansible-playbook -i <inventory> <file>. Keywarden changed nothing.`);
+  } catch (error) { showError(error.message); }
+}
+async function readFiles(input) {
+  const parts = [];
+  for (const file of input.files) {
+    if (file.size > 5000000) throw new Error(`${file.name} is larger than 5 MB.`);
+    parts.push(await file.text());
+  }
+  return parts.join("\n");
 }
 
 const TITLES = { findings: "Findings", review: "Access Review", find: "Find a Key" };
@@ -690,7 +813,9 @@ $("lab").addEventListener("click", async () => {
   try {
     const data = await api("/api/lab-keys");
     $("allow").value = data.keys.join("\n");
+    state.ownersText = data.owners || ""; state.leaversText = data.leavers || "";
     $("t-lab").checked = true;
+    showInfo("Lab keys loaded, with example owners and two leavers for the access review.");
   } catch (error) { showError(error.message); }
 });
 $("drop").addEventListener("click", () => {
@@ -716,6 +841,12 @@ $("prior").addEventListener("change", async (event) => {
   try { state.prior = JSON.parse(await file.text()); showError(""); }
   catch { showError("That file is not a Keywarden JSON report."); event.target.value = ""; }
 });
+for (const [id, field, label] of [["owners-file", "ownersText", "owners"], ["leavers-file", "leaversText", "leavers"], ["ca-file", "caText", "CA"]]) {
+  $(id).addEventListener("change", async (event) => {
+    try { state[field] = await readFiles(event.target); showError(""); }
+    catch (error) { state[field] = ""; event.target.value = ""; showError(error.message || `That ${label} file could not be read.`); }
+  });
+}
 for (const tab of document.querySelectorAll('[role="tab"]')) tab.addEventListener("click", () => showView(tab.dataset.view));
 for (const id of ["host", "inventory"]) $(id).addEventListener("focus", () => { $(id === "host" ? "t-host" : "t-inv").checked = true; });
 restoreSettings();

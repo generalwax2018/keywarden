@@ -29,6 +29,118 @@ jobs:
           python -m pip install dist/*.whl
           keywarden --version
 
+  portable:
+    # Windows runs Keywarden as an SSH client; macOS can also be checked itself.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: unit tests
+        run: python -m unittest discover -s tests -v
+      - name: package builds and installs
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip wheel --no-deps -w dist .
+          python -m pip install dist/*.whl
+          keywarden --version
+
+  macos-collector:
+    # The collector script and --local, run on a real Mac (Directory Services users, unified log).
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: collector script runs as root and parses
+        run: |
+          PYTHONPATH=src python3 -c "from keywarden.collect import REMOTE_SCRIPT; print(REMOTE_SCRIPT)" > collector.sh
+          sudo sh collector.sh root "$USER" > observation.txt
+          head -5 observation.txt
+          grep -q "^ACCOUNT $USER$" observation.txt
+          set +e
+          PYTHONPATH=src python3 -m keywarden check --observation observation.txt --verbose --color never
+          code=$?
+          set -e
+          test "$code" -eq 0 -o "$code" -eq 1
+      - name: local check
+        run: |
+          set +e
+          sudo PYTHONPATH=src python3 -m keywarden check --local --json > local.json
+          code=$?
+          set -e
+          test "$code" -eq 0 -o "$code" -eq 1
+          python3 -c "import json; h=json.load(open('local.json'))['host']; print(h['sshdRead'], h['authLog'], len(h['findings']))"
+
+  freebsd-collector:
+    # The same collector script on FreeBSD: BSD stat, sed, and bzip2-rotated logs.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: write the collector script
+        run: PYTHONPATH=src python3 -c "from keywarden.collect import REMOTE_SCRIPT; print(REMOTE_SCRIPT)" > collector.sh
+      - name: run it on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          run: |
+            pw useradd kwtest -m
+            mkdir -p /home/kwtest/.ssh
+            ssh-keygen -q -t ed25519 -N '' -f /tmp/k
+            cp /tmp/k.pub /home/kwtest/.ssh/authorized_keys
+            chown -R kwtest /home/kwtest/.ssh
+            chmod 700 /home/kwtest/.ssh
+            chmod 600 /home/kwtest/.ssh/authorized_keys
+            sh collector.sh root kwtest > observation.txt
+            head -5 observation.txt
+      - name: parse the FreeBSD observation
+        run: |
+          grep -q "^ACCOUNT kwtest$" observation.txt
+          set +e
+          PYTHONPATH=src python3 -m keywarden check --observation observation.txt --verbose --color never
+          code=$?
+          set -e
+          test "$code" -eq 0 -o "$code" -eq 1
+
+  container:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: image builds, runs as non-root, and has ssh
+        run: |
+          docker build -t keywarden:ci .
+          docker run --rm keywarden:ci --version
+          test "$(docker run --rm --entrypoint id keywarden:ci -u)" = "10001"
+          docker run --rm --entrypoint ssh keywarden:ci -V
+
+  action:
+    # The repository's own GitHub Action, against a host that cannot be reached:
+    # it must produce SARIF and report exit code 1, not crash.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - run: printf '[web]\nunreachable-01 ansible_host=192.0.2.10\n' > ci-hosts.ini
+      - id: kw
+        uses: ./
+        with:
+          inventory: ci-hosts.ini
+          upload-sarif: "false"
+          args: --jobs 2
+      - run: |
+          test "${{ steps.kw.outputs.exit-code }}" = "1"
+          python3 -c "import json; d=json.load(open('keywarden.sarif')); assert d['runs'][0]['results'], d"
+
   real-sshd:
     # End to end against a running OpenSSH server: local read, remote read over
     # SSH, and a hostile authorized_keys that tries to rewrite the observation.

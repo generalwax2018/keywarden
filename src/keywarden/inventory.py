@@ -21,7 +21,52 @@ _ALIASES = {
     "ansible_ssh_port": "port",
     "ansible_ssh_private_key_file": "key",
     "ansible_private_key_file": "key",
+    "ansible_ssh_common_args": "sshargs",
+    "ansible_ssh_extra_args": "sshargs2",
 }
+_HOP = re.compile(r"^(?:[A-Za-z0-9_][A-Za-z0-9_.-]*@)?[A-Za-z0-9][A-Za-z0-9._-]{0,253}(?::\d{1,5})?$")
+
+
+def jump_from_args(text: str | None) -> str | None:
+    """ProxyJump from ansible_ssh_common_args: -J, -o ProxyJump=, or ProxyCommand 'ssh -W %h:%p bastion'."""
+    if not text:
+        return None
+    import shlex
+
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        return None
+    found: str | None = None
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        option = None
+        if token == "-J" and index + 1 < len(tokens):
+            found = tokens[index + 1]
+            index += 2
+            continue
+        if token.startswith("-J") and len(token) > 2:
+            found = token[2:]
+        elif token == "-o" and index + 1 < len(tokens):
+            option = tokens[index + 1]
+            index += 1
+        elif token.startswith("-o") and len(token) > 2:
+            option = token[2:]
+        if option:
+            name, _, value = option.replace("=", " ", 1).partition(" ")
+            if name.lower() == "proxyjump":
+                found = value.strip()
+            elif name.lower() == "proxycommand":
+                parts = value.split()
+                if parts and parts[0].rsplit("/", 1)[-1] == "ssh" and "-W" in parts:
+                    hosts = [part for part in parts[1:] if not part.startswith("-") and "%" not in part]
+                    if hosts:
+                        found = hosts[-1]
+        index += 1
+    if found and found.lower() != "none" and all(_HOP.fullmatch(hop) for hop in found.split(",")):
+        return found
+    return None
 
 
 @dataclass(frozen=True)
@@ -31,6 +76,7 @@ class InventoryHost:
     user: str | None
     port: int | None
     identity_file: str | None = None
+    jump: str | None = None
 
     @property
     def destination(self) -> str:
@@ -61,8 +107,40 @@ def _port(value: str, name: str) -> int:
 def _unquote(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-        return value[1:-1]
+        inner = value[1:-1]
+        return inner.replace('\\"', '"') if value[0] == '"' else inner
     return value
+
+
+def _split_host_line(line: str) -> list[str]:
+    """Split on spaces outside quotes, so key="a b" stays one token. Quotes are kept for _unquote."""
+    tokens: list[str] = []
+    current: list[str] = []
+    quote = ""
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            if char == "\\" and index + 1 < len(line):
+                current.append(line[index : index + 2])
+                index += 2
+                continue
+            if char == quote:
+                quote = ""
+            current.append(char)
+        elif char in "'\"":
+            quote = char
+            current.append(char)
+        elif char.isspace():
+            if current:
+                tokens.append("".join(current))
+                current = []
+        else:
+            current.append(char)
+        index += 1
+    if current:
+        tokens.append("".join(current))
+    return tokens
 
 
 def _keep(key: str, value: str, into: dict[str, str]) -> None:
@@ -148,7 +226,7 @@ def parse_inventory(text: str, source: str | None = None) -> list[InventoryHost]
             if group not in parents.setdefault(child, []):
                 parents[child].append(group)
             continue
-        parts = line.split()
+        parts = _split_host_line(line)
         names = _expand(parts[0])
         chosen: dict[str, str] = {}
         for part in parts[1:]:
@@ -195,7 +273,8 @@ def parse_inventory(text: str, source: str | None = None) -> list[InventoryHost]
         identity = merged.get("key") or None
         if identity is not None and (identity.startswith("-") or "{{" in identity):
             raise ValueError(f"{name} has a private-key path Keywarden cannot pass to ssh")
-        hosts.append(InventoryHost(name, address, user, port, identity))
+        jump = jump_from_args(merged.get("sshargs")) or jump_from_args(merged.get("sshargs2"))
+        hosts.append(InventoryHost(name, address, user, port, identity, jump))
     return hosts
 
 
@@ -220,7 +299,8 @@ def _host_from_vars(name: str, values: dict) -> InventoryHost:
     identity = chosen.get("key") or None
     if identity is not None and (identity.startswith("-") or "{{" in identity):
         raise ValueError(f"{name} has a private-key path Keywarden cannot pass to ssh")
-    return InventoryHost(name, address, user, port, identity)
+    jump = jump_from_args(chosen.get("sshargs")) or jump_from_args(chosen.get("sshargs2"))
+    return InventoryHost(name, address, user, port, identity, jump)
 
 
 def parse_inventory_json(text: str) -> list[InventoryHost]:

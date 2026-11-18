@@ -24,11 +24,15 @@ CIS Controls v8 safeguards, NIST SP 800-53 Rev. 5, PCI DSS v4.0, and NERC CIP-00
 | `empty-passwords` | 5.2 | IA-5(1) | 8.3.1, 8.3.6 | CIP-007-6 R5.5 |
 | `expired-key` | – | IA-5 | 8.2.6 | – |
 | `forced-command-forwarding` | 4.1 | CM-7, AC-17 | 2.2.4 | – |
+| `host-certificate` | – | IA-3, SC-17 | – | – |
 | `hostbased-auth` | 4.1 | IA-2, AC-17 | 8.3.1 | CIP-007-6 R5.1 |
+| `jump-host` | – | AC-17, SC-7 | – | CIP-005-7 R2.1 |
 | `key-environment` | 4.1 | CM-6, CM-7 | 2.2.1 | – |
+| `key-owner` | 5.1 | AC-2, IA-4 | 8.2.1 | CIP-004-7 R4.1 |
 | `key-source` | – | AC-17, AC-6 | 7.2.2 | CIP-005-7 R2.1 |
 | `key-to-root` | 5.4, 6.8 | AC-6, AC-6(5) | 7.2.2 | CIP-004-7 R4.3 |
 | `keyboard-interactive` | 4.1 | IA-2, IA-5(1) | 8.3.1 | CIP-007-6 R5.1 |
+| `leaver-key` | 6.2 | AC-2, PS-4 | 8.2.5 | CIP-004-7 R5.1 |
 | `log-level` | 8.2 | AU-2, AU-12 | 10.2.1 | CIP-007-6 R4.1 |
 | `match-blocks` | 4.1 | CM-6 | 2.2.1 | – |
 | `outside-push` | 5.1, 6.1, 6.2 | AC-2 | 7.2.1, 7.2.4, 8.2.5 | CIP-004-7 R4.1, CIP-004-7 R4.3 |
@@ -53,5 +57,7 @@ Every control ID and title was checked against the framework text for the versio
 
 - **Removed:** CIS 6.5 and PCI DSS 8.4.2 (MFA). A host scan can show passwords are off, not that a second factor is required.
 - **Changed:** `auth-log` now checks how far back sshd's login log goes (warns under 90 days) and maps to log retention (CIS 8.10, NIST AU-11, PCI DSS 10.5.1). It used to map to log review (CIS 8.11, NIST AU-6, PCI DSS 10.4.1), which is a process a scan cannot show.
+
+0.5.0 added four checks. `leaver-key` and `key-owner` are evidence for revoking access on termination and for knowing who holds each credential; they depend on the owners and leavers lists being right, which a scan cannot show. `jump-host` shows how Keywarden reached each host, which is evidence for CIP-005-7 R2.1 only where direct access is also blocked at the network. A signed review record from `keywarden review` is the reviewer's attestation, not Keywarden's.
 
 The mapping has been reviewed by the maintainer, not yet by an independent assessor. If you assess against one of these frameworks and something reads wrong, please open a **Compliance mapping correction** issue with the check, the control, and why. Corrections are credited in the changelog.

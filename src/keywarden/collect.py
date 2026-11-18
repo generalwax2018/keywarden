@@ -17,8 +17,8 @@ from pathlib import Path
 from keywarden.check import Account, HostObservation, SshdFacts, parse_sshd
 from keywarden.parse import parse_public_keys
 
-PROTOCOL_VERSION = 3
-SUPPORTED_PROTOCOLS = {2, 3}
+PROTOCOL_VERSION = 4
+SUPPORTED_PROTOCOLS = {2, 3, 4}
 
 # Address and user that sshd -T -C uses to evaluate Match blocks for root.
 # 192.0.2.1 is TEST-NET-1 and keywarden.invalid cannot resolve, so only
@@ -40,7 +40,7 @@ _ROOT_FIELDS = (
 # who controls their own file cannot write protocol markers into the stream.
 REMOTE_SCRIPT = r"""
 set -u
-echo KEYWARDEN 3
+echo KEYWARDEN 4
 echo "HOST $(hostname 2>/dev/null || echo unknown)"
 echo "NOW $(date +%s 2>/dev/null || echo unknown) $(date +%z 2>/dev/null || echo +0000)"
 P=""
@@ -139,7 +139,7 @@ fi
 if [ "$log_source" = "none" ]; then
   log_files=""
   for base in /var/log/auth.log /var/log/secure; do
-    rotated=$(ls -1 "$base".[0-9]* 2>/dev/null | sed 's/^\(.*\.\)\([0-9][0-9]*\)\(\.gz\)\{0,1\}$/\2 &/' | sort -k1,1nr | cut -d' ' -f2)
+    rotated=$(ls -1 "$base".[0-9]* 2>/dev/null | sed -E 's/^(.*\.)([0-9]+)(\.gz|\.bz2|\.xz)?$/\2 &/' | sort -k1,1nr | cut -d' ' -f2)
     dated=$(ls -1 "$base"-[0-9]* 2>/dev/null | sort)
     for candidate in $rotated $dated "$base"; do
       if [ -e "$candidate" ]; then
@@ -155,10 +155,23 @@ if [ "$log_source" = "none" ]; then
       fi
     done
     if [ "$log_source" = "file" ]; then
-      log_out=$(for candidate in $log_files; do p gzip -cdf "$candidate" 2>/dev/null; done | awk "$LOGAWK")
+      log_out=$(for candidate in $log_files; do
+        case $candidate in
+          *.bz2) p bzip2 -cd "$candidate" 2>/dev/null ;;
+          *.xz) p xz -cd "$candidate" 2>/dev/null ;;
+          *) p gzip -cdf "$candidate" 2>/dev/null ;;
+        esac
+      done | awk "$LOGAWK")
     else
       log_out=""
     fi
+  fi
+fi
+# macOS keeps sshd's log in the unified log, not in a file.
+if [ "$log_source" = "none" ] && [ "$(uname -s 2>/dev/null)" = "Darwin" ] && [ -x /usr/bin/log ]; then
+  log_out=$(p /usr/bin/log show --style syslog --info --last 90d --predicate 'process == "sshd" OR process == "sshd-session"' 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2} ' | awk "$LOGAWK")
+  if [ -n "$log_out" ]; then
+    log_source=unified
   fi
 fi
 echo "AUTHLOG $log_source"
@@ -265,6 +278,75 @@ emit_account() {
   fi
   emit_keys "$home/.ssh/authorized_keys"
 }
+# Public files sshd trusts: the user CA keys, and this host's own certificates.
+# Lines carry the "K " prefix like authorized_keys.
+emit_pubfiles() {
+  tag=$1
+  shift
+  state=none
+  body=""
+  for f in "$@"; do
+    [ -n "$f" ] || continue
+    [ "$f" = "none" ] && continue
+    if [ "$(access_of "$f")" = "absent" ]; then
+      [ "$state" = "none" ] && state=absent
+      continue
+    fi
+    if out=$(p cat "$f" 2>/dev/null); then
+      [ "$state" = "unreadable" ] || state=ok
+      body="$body$out
+"
+    else
+      state=unreadable
+    fi
+  done
+  if [ -z "$sshd_out" ]; then
+    state=unknown
+  fi
+  echo "$tag $state"
+  if [ -n "$body" ]; then
+    printf '%s' "$body" | awk '{ print "K " $0 }'
+  fi
+  echo "END$tag"
+}
+ca_paths=$(printf '%s\n' "$sshd_out" | awk 'tolower($1) == "trustedusercakeys" { print $2 }')
+cert_paths=$(printf '%s\n' "$sshd_out" | awk 'tolower($1) == "hostcertificate" { print $2 }')
+emit_pubfiles TRUSTEDCA $ca_paths
+emit_pubfiles HOSTCERT $cert_paths
+IS_DARWIN=no
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ] && command -v dscl >/dev/null 2>&1; then
+  IS_DARWIN=yes
+fi
+# macOS keeps users in Directory Services; /etc/passwd lists only a few system accounts.
+dscl_entry() {
+  home=$(dscl . -read "/Users/$1" NFSHomeDirectory 2>/dev/null | awk 'NR == 1 { print $2 }')
+  uid=$(dscl . -read "/Users/$1" UniqueID 2>/dev/null | awk 'NR == 1 { print $2 }')
+  if [ -n "$home" ]; then
+    echo "$1:x:$uid:::$home:"
+  fi
+}
+passwd_entry() {
+  found=""
+  if command -v getent >/dev/null 2>&1; then
+    found=$(getent passwd "$1" 2>/dev/null | head -n 1)
+  fi
+  if [ -z "$found" ] && [ "$IS_DARWIN" = "yes" ]; then
+    found=$(dscl_entry "$1")
+  fi
+  if [ -z "$found" ] && [ -r /etc/passwd ]; then
+    found=$(awk -F: -v u="$1" '$1 == u { print; exit }' /etc/passwd)
+  fi
+  printf '%s' "$found"
+}
+passwd_db() {
+  if [ "$IS_DARWIN" = "yes" ]; then
+    dscl . -list /Users UniqueID 2>/dev/null | while read -r name _uid; do
+      dscl_entry "$name"
+    done
+  else
+    cat /etc/passwd
+  fi
+}
 seen_users=" "
 mark() { seen_users="$seen_users$1 "; }
 already() {
@@ -283,7 +365,7 @@ locked_of() {
 for user in "$@"; do
   [ -n "$user" ] || continue
   already "$user" && continue
-  entry=$(getent passwd "$user" 2>/dev/null | head -n 1)
+  entry=$(passwd_entry "$user")
   home=$(printf '%s' "$entry" | awk -F: 'NR==1 { print $6 }')
   uid=$(printf '%s' "$entry" | awk -F: 'NR==1 { print $3 }')
   pass=$(printf '%s' "$entry" | awk -F: 'NR==1 { print $2 }')
@@ -300,9 +382,9 @@ for user in "$@"; do
   emit_account "$user" "$home" "$uid" "$(locked_of "$pass")"
   mark "$user"
 done
-if [ -r /etc/passwd ]; then
+if [ -r /etc/passwd ] || [ "$IS_DARWIN" = "yes" ]; then
   echo "PASSWD ok"
-  while IFS=: read -r user pass uid _gid _gecos home _shell; do
+  passwd_db | while IFS=: read -r user pass uid _gid _gecos home _shell; do
     [ -n "${user:-}" ] || continue
     already "$user" && continue
     if [ -z "${home:-}" ]; then
@@ -328,7 +410,7 @@ if [ -r /etc/passwd ]; then
     [ "$want" -eq 1 ] || continue
     emit_account "$user" "$home" "$uid" "$(locked_of "$pass")"
     mark "$user"
-  done < /etc/passwd
+  done
 else
   echo "PASSWD unreadable"
 fi
@@ -418,6 +500,18 @@ def _password_locked(field: str) -> bool | None:
 
 def _passwd_records() -> tuple[dict[str, tuple[Path | None, int | None, bool | None]], str]:
     records: dict[str, tuple[Path | None, int | None, bool | None]] = {}
+    import sys
+
+    if sys.platform == "darwin":
+        # Directory Services users are not in /etc/passwd. pwd asks the system for them.
+        import pwd
+
+        for entry in pwd.getpwall():
+            if entry.pw_name.startswith("_") and entry.pw_uid != 0:
+                continue
+            home = Path(entry.pw_dir) if entry.pw_dir else None
+            records.setdefault(entry.pw_name, (home, entry.pw_uid, None))
+        return records, "ok" if records else "unreadable"
     try:
         text = Path("/etc/passwd").read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -655,6 +749,9 @@ def collect_local(extra_users: list[str] | None = None) -> HostObservation:
     now = int(time.time())
     offset = time.strftime("%z")
     log_source, log_since, logins = _local_logins(now, offset)
+    known = sshd_state == "ok"
+    ca_state, ca_keys = _local_pubfiles(sshd.trusted_user_ca_keys.split() if known else [], known)
+    cert_state, cert_keys = _local_pubfiles(sshd.host_certificate.split() if known else [], known)
     return HostObservation(
         name=socket.gethostname(),
         address="local",
@@ -671,7 +768,37 @@ def collect_local(extra_users: list[str] | None = None) -> HostObservation:
         log_source=log_source,
         log_since=log_since,
         logins=logins,
+        trusted_ca_state=ca_state,
+        trusted_cas=ca_keys,
+        host_cert_state=cert_state,
+        host_certs=cert_keys,
     )
+
+
+def _local_pubfiles(paths: list[str], known: bool):
+    if not known:
+        return "unknown", []
+    state = "none"
+    keys = []
+    for path in paths:
+        if not path or path == "none":
+            continue
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            state = "absent" if state == "none" else state
+            continue
+        except OSError:
+            state = "unreadable"
+            continue
+        try:
+            found, _issues = parse_public_keys(text)
+        finally:
+            del text
+        keys.extend(found)
+        if state != "unreadable":
+            state = "ok"
+    return state, keys
 
 
 class ProtocolError(ValueError):
@@ -716,6 +843,7 @@ def parse_protocol(text: str, address: str = "observation") -> HostObservation:
     accounts: list[Account] = []
     seen_users: set[str] = set()
     seen: set[str] = set()
+    pubfiles: dict[str, tuple[str, list[str]]] = {}
     ended = False
 
     def once(tag: str, index: int) -> None:
@@ -783,6 +911,15 @@ def parse_protocol(text: str, address: str = "observation") -> HostObservation:
         elif line == "SSHDROOT":
             once("SSHDROOT", index)
             root_lines, index = block(index, "ENDSSHDROOT")
+        elif line.startswith(("TRUSTEDCA ", "HOSTCERT ")):
+            tag, _, state = line.partition(" ")
+            once(tag, index)
+            body, index = block(index, "END" + tag)
+            for position, entry in enumerate(body):
+                if entry != "K" and not entry.startswith("K "):
+                    raise _malformed(index - len(body) - 1 + position, f"{tag} line without the K prefix")
+            pubfiles[tag] = (state.strip() or "unknown", [entry[2:] for entry in body])
+            body.clear()
         elif line.startswith("ACCOUNT "):
             account, index = _parse_account(lines, index)
             if account.user in seen_users:
@@ -798,6 +935,8 @@ def parse_protocol(text: str, address: str = "observation") -> HostObservation:
         raise ProtocolError("observation is incomplete: END is missing")
     root = parse_sshd(_root_lines("\n".join(root_lines))) if root_lines else None
     log_since, logins = _read_logins(login_lines or [], now, offset, start=0)
+    ca_state, ca_keys = _pubfile_keys(pubfiles.get("TRUSTEDCA"))
+    cert_state, cert_keys = _pubfile_keys(pubfiles.get("HOSTCERT"))
     return HostObservation(
         name=name,
         address=address,
@@ -814,7 +953,24 @@ def parse_protocol(text: str, address: str = "observation") -> HostObservation:
         log_source=log_source,
         log_since=log_since,
         logins=logins,
+        trusted_ca_state=ca_state,
+        trusted_cas=ca_keys,
+        host_cert_state=cert_state,
+        host_certs=cert_keys,
     )
+
+
+def _pubfile_keys(entry: tuple[str, list[str]] | None):
+    if entry is None:
+        return "unknown", []
+    state, body = entry
+    joined = "\n".join(body)
+    try:
+        keys, _issues = parse_public_keys(joined)
+    finally:
+        del joined
+        body.clear()
+    return state, keys
 
 
 def _read_logins(lines: list[str], now: int | None, offset: str | None, start: int):
@@ -921,6 +1077,7 @@ def collect_remote(
     *,
     accept_new: bool = False,
     identity_file: str | None = None,
+    jump: str | None = None,
 ) -> HostObservation:
     if not _DESTINATION.fullmatch(destination) or destination.startswith("-"):
         raise ValueError("host must look like user@hostname")
@@ -951,6 +1108,8 @@ def collect_remote(
             raise ValueError("identity file path is not usable")
         # The path is handed to ssh. Keywarden never opens it.
         options.extend(["-i", os.path.expanduser(identity_file), "-o", "IdentitiesOnly=yes"])
+    if jump is not None:
+        options.extend(["-J", _checked_jump(jump)])
     command = ["ssh", *options, "--", destination, "sh", "-s", "--", *users]
     try:
         # Bytes, not text: in text mode Windows would turn every newline in the
@@ -979,6 +1138,41 @@ def collect_remote(
         return parse_protocol(output, address=destination)
     finally:
         del output
+
+
+def _checked_jump(jump: str) -> str:
+    from keywarden.inventory import _HOP
+
+    if not jump or jump.startswith("-") or not all(_HOP.fullmatch(hop) for hop in jump.split(",")):
+        raise ValueError("jump host must look like [user@]host[:port], comma-separated")
+    return jump
+
+
+def access_path(destination: str, port: int | None = None, jump: str | None = None) -> dict:
+    """How ssh will reach the host: through a jump host (inventory or ~/.ssh/config), or directly."""
+    if jump:
+        return {"via": jump, "source": "inventory"}
+    if not _DESTINATION.fullmatch(destination) or destination.startswith("-"):
+        return {"via": None, "source": "unknown"}
+    command = ["ssh", "-G"]
+    if port is not None:
+        command += ["-p", str(port)]
+    command += ["--", destination]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=5, check=False, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return {"via": None, "source": "unknown"}
+    if completed.returncode != 0:
+        return {"via": None, "source": "unknown"}
+    settings: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        name, _, value = line.partition(" ")
+        settings.setdefault(name.lower(), value.strip())
+    if settings.get("proxyjump", "none").lower() != "none":
+        return {"via": settings["proxyjump"], "source": "ssh config"}
+    if settings.get("proxycommand", "none").lower() != "none":
+        return {"via": "ProxyCommand", "source": "ssh config"}
+    return {"via": None, "source": "direct"}
 
 
 def read_observation(path: str) -> str:

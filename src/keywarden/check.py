@@ -34,6 +34,7 @@ class SshdFacts:
     allow_agent_forwarding: str = "unknown"
     x11_forwarding: str = "unknown"
     permit_user_environment: str = "unknown"
+    host_certificate: str = "unknown"  # space-separated paths; sshd may list several
 
     def as_dict(self) -> dict:
         return {
@@ -55,6 +56,7 @@ class SshdFacts:
             "allowAgentForwarding": self.allow_agent_forwarding,
             "x11Forwarding": self.x11_forwarding,
             "permitUserEnvironment": self.permit_user_environment,
+            "hostCertificate": self.host_certificate,
         }
 
 
@@ -98,6 +100,11 @@ class HostObservation:
     log_source: str = "unknown"  # journal, file, none, unreadable, unknown
     log_since: int | None = None  # earliest log line the collector saw
     logins: dict[tuple[str, str], Login] = field(default_factory=dict)
+    trusted_ca_state: str = "unknown"  # ok, none, absent, unreadable, unknown
+    trusted_cas: list[KeyRef] = field(default_factory=list)
+    host_cert_state: str = "unknown"
+    host_certs: list[KeyRef] = field(default_factory=list)
+    access_path: dict | None = None  # how Keywarden reached the host: direct or through a jump host
 
 
 @dataclass
@@ -146,16 +153,24 @@ class Policy:
     flag_outside_push: bool = True
     flag_weak: bool = True
     stale_days: int = 90
+    owners: object | None = None  # keywarden.owners.OwnerBook
+    allowed_cas: frozenset[str] | None = None  # approved CA fingerprints, from --allow-ca
+    max_cert_days: int = 90
+    require_jump: bool = False
 
 
 def parse_sshd(text: str) -> SshdFacts:
     mapped: dict[str, str] = {}
+    certs: list[str] = []
     for line in text.splitlines():
         trimmed = line.strip()
         if not trimmed or trimmed.startswith("#"):
             continue
         parts = trimmed.split(None, 1)
         if len(parts) != 2 or not parts[0][:1].isalpha():
+            continue
+        if parts[0].lower() == "hostcertificate":
+            certs.append(parts[1].strip())
             continue
         mapped[parts[0].lower()] = parts[1].strip()
 
@@ -183,6 +198,7 @@ def parse_sshd(text: str) -> SshdFacts:
         allow_agent_forwarding=pick("allowagentforwarding"),
         x11_forwarding=pick("x11forwarding"),
         permit_user_environment=pick("permituserenvironment"),
+        host_certificate=" ".join(certs) if certs else ("none" if mapped else "unknown"),
     )
 
 
@@ -521,8 +537,21 @@ def evaluate(host: HostObservation, push: list[KeyRef], policy: Policy) -> list[
                 "Nothing in authorized_keys is marked cert-authority, so one line cannot sign in extra keys.",
             )
         )
+    elif policy.allowed_cas is not None and all(key.fingerprint in policy.allowed_cas for key in authorities):
+        findings.append(
+            Finding(
+                "cert-authority",
+                "pass",
+                "Only approved CAs are trusted in authorized_keys",
+                _describe(authorities) + ". Each is on the --allow-ca list.",
+            )
+        )
     else:
+        if policy.allowed_cas is not None:
+            authorities = [key for key in authorities if key.fingerprint not in policy.allowed_cas]
         title = "A line trusts a certificate authority" if _unique_count(authorities) == 1 else f"{_unique_count(authorities)} lines trust a certificate authority"
+        if policy.allowed_cas is not None:
+            title = "A line trusts a CA that is not approved" if _unique_count(authorities) == 1 else f"{_unique_count(authorities)} lines trust CAs that are not approved"
         findings.append(
             Finding(
                 "cert-authority",
@@ -539,6 +568,7 @@ def evaluate(host: HostObservation, push: list[KeyRef], policy: Policy) -> list[
             continue
         by_fingerprint.setdefault(key.fingerprint, []).append(key)
     problems = []
+    loose: list[str] = []
     for fingerprint, items in by_fingerprint.items():
         key = items[0]
         cert = key.cert
@@ -555,9 +585,26 @@ def evaluate(host: HostObservation, push: list[KeyRef], policy: Policy) -> list[
             problems.append(f"{who} is not valid yet")
         elif cert and cert.valid_before is not None and cert.valid_before < now:
             problems.append(f"{who} has expired")
+        elif cert and policy.allowed_cas is not None and cert.ca_fingerprint not in policy.allowed_cas:
+            problems.append(f"{who} is signed by a CA that is not approved ({cert.ca_fingerprint})")
+        elif cert:
+            lifetime = _cert_lifetime_problem(cert, policy.max_cert_days)
+            if lifetime:
+                loose.append(f"{who} {lifetime}")
+            elif not cert.principals:
+                loose.append(f"{who} names no principals, so it is valid for any account")
     if problems:
         title = "An SSH certificate is not acceptable" if len(problems) == 1 else f"{len(problems)} SSH certificates are not acceptable"
         findings.append(Finding("ssh-certificate", "fail", title, "; ".join(problems)))
+    elif loose:
+        findings.append(
+            Finding(
+                "ssh-certificate",
+                "warn",
+                "An SSH certificate is broader than it needs to be" if len(loose) == 1 else f"{len(loose)} SSH certificates are broader than they need to be",
+                "; ".join(loose) + f". Issue short-lived certificates (at most {policy.max_cert_days} days) for named principals.",
+            )
+        )
     elif any(key.cert for key in all_keys):
         findings.append(
             Finding(
@@ -600,7 +647,7 @@ def evaluate(host: HostObservation, push: list[KeyRef], policy: Policy) -> list[
     if seen(host.sshd.trusted_user_ca_keys):
         trusted = host.sshd.trusted_user_ca_keys.strip().lower() not in {"", "none"}
         if trusted:
-            findings.append(Finding("trusted-user-ca", "fail", "A user CA can authorize keys that were not pushed", f"TrustedUserCAKeys is {host.sshd.trusted_user_ca_keys}."))
+            findings.append(_trusted_ca_finding(host, policy))
         else:
             findings.append(Finding("trusted-user-ca", "pass", "No user CA is trusted", "TrustedUserCAKeys is none."))
         if trusted and seen(host.sshd.revoked_keys):
@@ -645,7 +692,83 @@ def evaluate(host: HostObservation, push: list[KeyRef], policy: Policy) -> list[
     from keywarden.access import access_findings
 
     findings.extend(access_findings(host, push, policy))
+    from keywarden.access import owner_findings, path_findings
+
+    findings.extend(host_certificate_findings(host, policy))
+    findings.extend(owner_findings(host, policy))
+    findings.extend(path_findings(host, policy))
     return findings
+
+
+def _cert_lifetime_problem(cert, max_days: int) -> str:
+    if cert.valid_before is None:
+        return "never expires"
+    days = (cert.valid_before - max(cert.valid_after, 0)) // 86400
+    if days > max_days:
+        return f"is valid for {days} days"
+    return ""
+
+
+def _trusted_ca_finding(host: HostObservation, policy: Policy) -> Finding:
+    path = host.sshd.trusted_user_ca_keys
+    prints = list(dict.fromkeys(key.fingerprint for key in host.trusted_cas))
+    shown = ", ".join(prints[:5]) if prints else "the CA keys could not be read"
+    if policy.allowed_cas is None:
+        return Finding(
+            "trusted-user-ca",
+            "fail",
+            "A user CA can authorize keys that were not pushed",
+            f"TrustedUserCAKeys is {path} ({shown}). Pass the CAs you run with --allow-ca to approve them.",
+        )
+    if host.trusted_ca_state != "ok":
+        return Finding(
+            "trusted-user-ca",
+            "warn",
+            "The trusted user CA file could not be checked",
+            f"TrustedUserCAKeys is {path}, and the file was {host.trusted_ca_state}. Run as root to compare it with --allow-ca.",
+        )
+    unapproved = [value for value in prints if value not in policy.allowed_cas]
+    if unapproved:
+        return Finding(
+            "trusted-user-ca",
+            "fail",
+            "sshd trusts a user CA that is not approved" if len(unapproved) == 1 else f"sshd trusts {len(unapproved)} user CAs that are not approved",
+            f"TrustedUserCAKeys ({path}) includes {', '.join(unapproved[:10])}, which is not on the --allow-ca list.",
+        )
+    return Finding("trusted-user-ca", "pass", "Only approved user CAs are trusted", f"TrustedUserCAKeys ({path}) holds {shown}, each on the --allow-ca list.")
+
+
+def host_certificate_findings(host: HostObservation, policy: Policy) -> list[Finding]:
+    value = host.sshd.host_certificate
+    if value in {"unknown", ""} or host.host_cert_state == "unknown":
+        return []
+    if value == "none":
+        return []
+    if host.host_cert_state != "ok":
+        return [Finding("host-certificate", "warn", "The host certificate could not be read", f"HostCertificate is {value}, and the file was {host.host_cert_state}.")]
+    now = host.now or int(time.time())
+    problems: list[str] = []
+    notes: list[str] = []
+    for key in host.host_certs:
+        cert = key.cert
+        if cert is None or cert.unreadable:
+            problems.append(f"{key.fingerprint} could not be read as a certificate")
+            continue
+        if cert.cert_type != "host":
+            problems.append(f"{key.fingerprint} is a {cert.cert_type} certificate, not a host certificate")
+        elif cert.valid_before is not None and cert.valid_before < now:
+            problems.append(f"{key.fingerprint} expired")
+        elif policy.allowed_cas is not None and cert.ca_fingerprint not in policy.allowed_cas:
+            problems.append(f"{key.fingerprint} is signed by a CA that is not approved ({cert.ca_fingerprint})")
+        elif cert.valid_before is None:
+            notes.append(f"{key.fingerprint} never expires")
+        elif cert.valid_before - now < 14 * 86400:
+            notes.append(f"{key.fingerprint} expires in {max(0, (cert.valid_before - now) // 86400)} day(s)")
+    if problems:
+        return [Finding("host-certificate", "fail", "A host certificate is not acceptable", "; ".join(problems) + ". Clients that check host certificates will refuse or warn.")]
+    if notes:
+        return [Finding("host-certificate", "warn", "A host certificate needs attention", "; ".join(notes) + ". Renew host certificates on a schedule, with an end date.")]
+    return [Finding("host-certificate", "pass", "The host certificate is valid", f"{len(host.host_certs)} host certificate(s) inside their validity window.")]
 
 
 def worst(findings: list[Finding]) -> str:

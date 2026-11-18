@@ -161,6 +161,7 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(codes["outside-push"], "fail")
 
 
+@unittest.skipUnless(os.name == "posix", "POSIX permissions and accounts")
 class LocalReadTests(unittest.TestCase):
     def test_missing_file_is_absent_and_unreadable_home_is_not(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -717,7 +718,7 @@ class InventoryGroupTests(unittest.TestCase):
         self.assertLess(command.index("--"), command.index("deploy@bastion"))
 
 
-@unittest.skipUnless(shutil.which("sh"), "sh unavailable")
+@unittest.skipUnless(os.name == "posix" and shutil.which("sh"), "a POSIX sh is needed")
 class RemoteScriptTests(unittest.TestCase):
     def test_script_output_parses_on_this_machine(self):
         from keywarden.collect import REMOTE_SCRIPT

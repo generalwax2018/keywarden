@@ -44,6 +44,7 @@ class CertInfo:
     key_id: str
     ca_fingerprint: str
     unreadable: bool = False
+    principals: tuple[str, ...] = ()
 
     def public(self) -> dict:
         return {
@@ -52,6 +53,7 @@ class CertInfo:
             "validBefore": self.valid_before,
             "keyId": self.key_id,
             "caFingerprint": self.ca_fingerprint,
+            "principals": len(self.principals),
         }
 
 
@@ -362,7 +364,15 @@ def read_certificate(key_type: str, raw: bytes) -> CertInfo | None:
         return None
     label = {1: "user", 2: "host"}.get(cert_type[0], "unknown")
     ident = key_id[0].decode("utf-8", errors="replace").replace("\x00", "").strip()[:80]
-    return CertInfo(label, valid_after[0], valid_before[0], ident, fingerprint_bytes(ca[0]), False)
+    names: list[str] = []
+    inner = 0
+    while inner < len(principals[0]) and len(names) < 256:
+        item = _read_string(principals[0], inner)
+        if not item:
+            break
+        names.append(item[0].decode("utf-8", errors="replace")[:64])
+        inner = item[1]
+    return CertInfo(label, valid_after[0], valid_before[0], ident, fingerprint_bytes(ca[0]), False, tuple(names))
 
 
 def _cert_authority(options: tuple[tuple[str, str | None], ...]) -> bool:

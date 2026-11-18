@@ -15,7 +15,7 @@ from pathlib import Path
 from keywarden import __version__
 from keywarden.access import key_rows, reach_of
 from keywarden.check import FINGERPRINT, HostObservation, Policy, PriorFindings, apply_drift, evaluate, worst
-from keywarden.collect import ProtocolError, collect_local, collect_remote, now_iso, parse_protocol, read_observation
+from keywarden.collect import ProtocolError, access_path, collect_local, collect_remote, now_iso, parse_protocol, read_observation
 from keywarden.inventory import InventoryHost, looks_like_yaml, parse_inventory, parse_inventory_json
 from keywarden.parse import PrivateKeyError, parse_public_keys
 from keywarden.term import Paint, use_colour
@@ -44,6 +44,8 @@ CSV_COLUMNS = [
     "lastUsed",
     "uses",
     "lastFrom",
+    "owner",
+    "ownerLeft",
 ]
 
 
@@ -68,8 +70,14 @@ def _load_prior(path: Path | None, hostname: str) -> PriorFindings | None:
     return prior_from_document(json.loads(path.read_text(encoding="utf-8")), hostname)
 
 
-def prior_from_document(document, hostname: str) -> PriorFindings | None:
+def prior_from_document(document, hostname: str, quiet: bool = False) -> PriorFindings | None:
     host = document.get("host") if isinstance(document, dict) else None
+    if host is None and isinstance(document, dict) and isinstance(document.get("hosts"), list):
+        host = next((item for item in document["hosts"] if isinstance(item, dict) and item.get("name") == hostname), None)
+        if host is None:
+            if not quiet:
+                print(f"prior report has no host named {hostname}; drift skipped", file=sys.stderr)
+            return None
     if not isinstance(host, dict):
         print("prior file has no host report; drift skipped", file=sys.stderr)
         return None
@@ -106,7 +114,7 @@ def _rows(host: HostObservation, push: list, policy: Policy, args: argparse.Name
 
 
 def _host_report(host: HostObservation, findings, rows: list[dict]) -> dict:
-    return {
+    report = {
         "name": host.name,
         "address": host.address,
         "role": host.role,
@@ -120,6 +128,9 @@ def _host_report(host: HostObservation, findings, rows: list[dict]) -> dict:
         "findings": [item.as_dict() for item in findings],
         "keys": rows,
     }
+    if host.access_path is not None:
+        report["accessPath"] = host.access_path
+    return report
 
 
 def _envelope(push: list) -> dict:
@@ -168,9 +179,11 @@ def _print_keys(rows: list[dict]) -> None:
     if not rows:
         print("no authorized keys were readable")
         return
-    header = ["host", "account", "fingerprint", "reach", "usage", "last used", "from", "comment"]
+    owners = any("owner" in row for row in rows)
+    header = ["host", "account", "fingerprint", "reach", "usage", "last used", "from", "comment"] + (["owner"] if owners else [])
     table = [header]
     for row in rows:
+        extra = [(row.get("owner") or "-") + (" (left)" if row.get("ownerLeft") else "")] if owners else []
         table.append(
             [
                 row["host"],
@@ -181,6 +194,7 @@ def _print_keys(rows: list[dict]) -> None:
                 (row["lastUsed"] or "-")[:10],
                 ",".join(row["options"].get("from", [])) or "any",
                 row["comment"] or "-",
+                *extra,
             ]
         )
     widths = [max(len(str(line[column])) for line in table) for column in range(len(header))]
@@ -197,11 +211,74 @@ def _write_evidence(path: Path, document: dict) -> None:
 def _write_machine_outputs(args: argparse.Namespace, document: dict) -> None:
     from keywarden.outputs import to_jsonl, to_sarif
 
+    if getattr(args, "fix_plan", None):
+        _write_fix_plan(args.fix_plan, document, _fix_reasons(args), None)
+
     if getattr(args, "sarif", None):
         inventory = getattr(args, "inventory", None)
         args.sarif.write_text(json.dumps(to_sarif(document, inventory), indent=2) + "\n", encoding="utf-8")
     if getattr(args, "jsonl", None):
         args.jsonl.write_text(to_jsonl(document), encoding="utf-8")
+
+
+def _add_owner_summary(args: argparse.Namespace, document: dict) -> None:
+    if getattr(args, "owners", None) is None:
+        return
+    from keywarden.owners import owner_summary
+
+    rows = [row for host in (document.get("hosts") or [document.get("host") or {}]) for row in host.get("keys", [])]
+    document["owners"] = owner_summary(rows)
+
+
+def _fix_reasons(args: argparse.Namespace) -> set[str]:
+    from keywarden.fixplan import DEFAULT_REASONS, REASONS
+
+    text = getattr(args, "fix_for", None)
+    wanted = set(DEFAULT_REASONS) if not text else {part.strip() for part in text.split(",") if part.strip()}
+    unknown = wanted - set(REASONS)
+    if unknown:
+        raise ValueError(f"--fix-for takes {', '.join(REASONS)}; not {', '.join(sorted(unknown))}")
+    return wanted
+
+
+def _write_fix_plan(path: Path, document: dict, wanted: set[str], review: dict | None) -> int:
+    from keywarden.fixplan import removals, render_playbook
+
+    items = removals(document, wanted, review)
+    path.write_text(render_playbook(items, generated=now_iso(), version=__version__), encoding="utf-8")
+    return sum(len(item["keys"]) for item in items)
+
+
+def _notify(args: argparse.Namespace, document: dict) -> None:
+    url = getattr(args, "notify", None) or os.environ.get("KEYWARDEN_WEBHOOK")
+    if not url:
+        return
+    from keywarden.notify import send
+
+    try:
+        if send(url, document, style=args.notify_format, when=args.notify_on):
+            print("summary posted to the webhook", file=sys.stderr)
+    except ValueError as exc:
+        print(f"webhook not sent: {exc}", file=sys.stderr)
+
+
+def _print_owners(document: dict, paint: Paint) -> None:
+    people = document.get("owners") or []
+    if not people:
+        return
+    print(paint("bold", "who has access"))
+    for person in people[:15]:
+        flag = "  " + paint("fail", "LEFT") if person["left"] else ""
+        parts = [f"{person['hosts']} host{'s' if person['hosts'] != 1 else ''}"]
+        if person["rootHosts"]:
+            parts.append(f"root on {person['rootHosts']}")
+        accounts = len(person["accounts"])
+        keys = len(person["keys"])
+        parts.append(f"{accounts} account{'s' if accounts != 1 else ''}")
+        parts.append(f"{keys} key{'s' if keys != 1 else ''}")
+        print(f"  {person['owner']}{flag}  {paint('dim', ' · '.join(parts))}")
+    if len(people) > 15:
+        print(paint("dim", f"  {len(people) - 15} more in the JSON report"))
 
 
 def _paint(args: argparse.Namespace) -> Paint:
@@ -226,6 +303,8 @@ def csv_text(rows: list[dict]) -> str:
         flat["allows"] = " ".join(options.get("allows", []))
         flat["inAllow"] = "" if row["inAllow"] is None else ("yes" if row["inAllow"] else "no")
         flat["certAuthority"] = "yes" if row["certAuthority"] else ""
+        if "ownerLeft" in row:
+            flat["ownerLeft"] = "yes" if row["ownerLeft"] else ""
         writer.writerow({key: _csv_safe(value) for key, value in flat.items()})
     return handle.getvalue()
 
@@ -266,10 +345,27 @@ def _policy(args: argparse.Namespace) -> Policy:
     stale = getattr(args, "stale_days", 90)
     if stale < 1:
         raise ValueError("--stale-days must be 1 or more")
+    max_cert = getattr(args, "max_cert_days", 90)
+    if max_cert < 1:
+        raise ValueError("--max-cert-days must be 1 or more")
+    book = None
+    if getattr(args, "owners", None) is not None or getattr(args, "leavers", None) is not None:
+        from keywarden.owners import load_book
+
+        book = load_book(args.owners, args.leavers, fetch_github=not getattr(args, "no_github", False))
+        for handle in book.unmatched_leavers():
+            print(f"leaver {handle} has no keys in the owners file, so their keys cannot be swept", file=sys.stderr)
+    cas = None
+    if getattr(args, "allow_ca", None):
+        cas = frozenset(key.fingerprint for path in args.allow_ca for key in _load_allow(path))
     return Policy(
         flag_outside_push=not getattr(args, "no_outside", False),
         flag_weak=not getattr(args, "no_weak", False),
         stale_days=stale,
+        owners=book,
+        allowed_cas=cas,
+        max_cert_days=max_cert,
+        require_jump=getattr(args, "require_jump", False),
     )
 
 
@@ -288,7 +384,10 @@ def _observe_one(args: argparse.Namespace) -> HostObservation:
     if args.local:
         return collect_local(args.account)
     if args.host:
-        return collect_remote(args.host, args.account, accept_new=args.accept_new)
+        jump = getattr(args, "jump", None)
+        observed = collect_remote(args.host, args.account, accept_new=args.accept_new, **({"jump": jump} if jump else {}))
+        observed.access_path = access_path(args.host, None, jump)
+        return observed
     raw = read_observation(args.observation)
     try:
         if len(raw.encode("utf-8", errors="replace")) > MAX_INPUT_BYTES:
@@ -382,9 +481,11 @@ def _observe_target(target: InventoryHost, args: argparse.Namespace) -> HostObse
         target.port,
         accept_new=args.accept_new,
         identity_file=target.identity_file,
+        **({"jump": target.jump} if target.jump else {}),
     )
     observed.name = target.name
     observed.address = target.destination
+    observed.access_path = access_path(target.destination, target.port, target.jump)
     return observed
 
 
@@ -401,6 +502,7 @@ def _check_one(args: argparse.Namespace) -> int:
     rows = _rows(host, push, policy, args)
     document = _envelope(push)
     document["host"] = _host_report(host, findings, rows)
+    _add_owner_summary(args, document)
     encoded = json.dumps(document, indent=2) + "\n"
     if args.output:
         args.output.write_text(encoded, encoding="utf-8")
@@ -409,10 +511,12 @@ def _check_one(args: argparse.Namespace) -> int:
     if args.evidence:
         _write_evidence(args.evidence, document)
     _write_machine_outputs(args, document)
+    _notify(args, document)
     if args.json:
         sys.stdout.write(encoded)
     else:
         _print_human(document, _paint(args), args.verbose)
+        _print_owners(document, _paint(args))
         if args.keys:
             print()
             _print_keys(rows)
@@ -442,8 +546,7 @@ def _unreachable(name: str, address: str, detail: str, code: str = "unreachable"
 
 
 def _check_inventory(args: argparse.Namespace) -> int:
-    if args.prior:
-        raise ValueError("--prior applies to one host; leave it off with --inventory")
+    prior_document = json.loads(args.prior.read_text(encoding="utf-8")) if args.prior else None
     push = _load_allow(args.allow)
     waivers = _waivers(args)
     if args.redact_comments:
@@ -467,7 +570,8 @@ def _check_inventory(args: argparse.Namespace) -> int:
             continue
         if args.redact_comments:
             _redact(observed, [])
-        findings = apply_waivers(evaluate(observed, push, policy), target.name, waivers, today, used)
+        prior = prior_from_document(prior_document, target.name, quiet=True) if prior_document is not None else None
+        findings = apply_waivers(apply_drift(evaluate(observed, push, policy), prior), target.name, waivers, today, used)
         rows = _rows(observed, push, policy, args)
         all_rows.extend(rows)
         host_reports.append(_host_report(observed, findings, rows))
@@ -476,6 +580,7 @@ def _check_inventory(args: argparse.Namespace) -> int:
     lines = _unique_failure_lines(found, plain)
     document = _envelope(push)
     document.update({"fingerprints": list(found), "posture": posture, "hosts": host_reports})
+    _add_owner_summary(args, document)
     encoded = json.dumps(document, indent=2) + "\n"
     if args.output:
         args.output.write_text(encoded, encoding="utf-8")
@@ -484,6 +589,7 @@ def _check_inventory(args: argparse.Namespace) -> int:
     if args.evidence:
         _write_evidence(args.evidence, document)
     _write_machine_outputs(args, document)
+    _notify(args, document)
     if args.json:
         sys.stdout.write(encoded)
     else:
@@ -495,6 +601,7 @@ def _check_inventory(args: argparse.Namespace) -> int:
         warning = sum(1 for item in host_reports if item["posture"] == "warn")
         summary = f"{len(targets)} hosts · {failing} failing · {warning} to review · {len(targets) - failing - warning} clear"
         print(paint("dim" if lines else "pass", summary))
+        _print_owners(document, paint)
         if args.keys:
             print()
             _print_keys(all_rows)
@@ -609,6 +716,47 @@ def _where(args: argparse.Namespace) -> int:
     return 0 if hits else 1
 
 
+def _read_decisions(path: Path) -> list[dict]:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if text.lstrip().startswith(("[", "{")):
+        data = json.loads(text)
+        return data.get("decisions", []) if isinstance(data, dict) else data
+    return [{key.strip().lower(): (value or "").strip() for key, value in row.items() if key} for row in csv.DictReader(io.StringIO(text))]
+
+
+def _review(args: argparse.Namespace) -> int:
+    from keywarden import review
+
+    if args.review_command == "record":
+        report = json.loads(args.report.read_text(encoding="utf-8"))
+        decisions = [dict(item, decision=str(item.get("decision", "")).lower()) for item in _read_decisions(args.decisions)]
+        record = review.build_record(report, {"name": args.reviewer, "role": args.role}, decisions)
+        args.output.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        args.output.with_suffix(".html").write_text(review.render_html(record), encoding="utf-8")
+        summary = record["summary"]
+        print(f"{summary['approved']} approved · {summary['revoked']} revoked · {summary['undecided']} undecided · sealed {record['sha256'][:16]}")
+        return 0
+    if args.review_command == "sign":
+        print(f"signature written to {review.sign(args.record, args.key)}")
+        return 0
+    print(review.verify(args.record, args.signers, args.identity))
+    return 0
+
+
+def _plan(args: argparse.Namespace) -> int:
+    from keywarden import review
+
+    report = json.loads(args.report.read_text(encoding="utf-8"))
+    record = None
+    if args.review:
+        record = json.loads(args.review.read_text(encoding="utf-8"))
+        review.check_record(record)
+    wanted = _fix_reasons(args) if (args.fix_for or not record) else set()
+    count = _write_fix_plan(args.output, report, wanted, record)
+    print(f"{count} key(s) in the fix plan: {args.output}")
+    return 0
+
+
 def _add_source(parser: argparse.ArgumentParser, inventory_help: str) -> None:
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--local", action="store_true", help="read this machine")
@@ -617,6 +765,7 @@ def _add_source(parser: argparse.ArgumentParser, inventory_help: str) -> None:
     source.add_argument("--inventory", type=Path, help=inventory_help)
     parser.add_argument("--jobs", "-j", type=int, default=8, help=f"hosts to check at once with --inventory (1-{MAX_JOBS}, default 8)")
     parser.add_argument("--account", action="append", default=[], help="extra account to read; repeatable")
+    parser.add_argument("--jump", "-J", help="with --host: reach it through this jump host ([user@]host[:port]); inventories use ProxyJump in ansible_ssh_common_args")
     parser.add_argument(
         "--accept-new",
         action="store_true",
@@ -635,7 +784,7 @@ def build_parser() -> argparse.ArgumentParser:
     check = sub.add_parser("check", help="check one host, or every host in an Ansible inventory")
     _add_source(check, "Ansible inventory: INI, ansible-inventory --list JSON, or YAML/dynamic (needs Ansible installed)")
     check.add_argument("--allow", type=Path, help="public keys you push; fingerprinted, not copied into the report")
-    check.add_argument("--prior", type=Path, help="earlier keywarden JSON report, for drift")
+    check.add_argument("--prior", type=Path, help="earlier keywarden JSON report (one host or a whole inventory), for drift")
     check.add_argument("--output", type=Path, help="write the JSON report here")
     check.add_argument("--json", action="store_true", help="print the JSON report")
     check.add_argument("--csv", type=Path, help="write the access review table (one row per authorized key) here")
@@ -655,12 +804,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="leave key comments (often an email or machine name) out of the output",
     )
     check.add_argument("--redact-addresses", action="store_true", help="leave the last login address out of the output")
+    people = check.add_argument_group("owners and leavers")
+    people.add_argument("--owners", type=Path, help="who owns each key: CSV, JSON, LDIF, or a directory of <person>.pub files")
+    people.add_argument("--leavers", type=Path, help="people who have left, one name, email, or GitHub user per line; their keys fail")
+    people.add_argument("--no-github", action="store_true", help="do not fetch https://github.com/<user>.keys for owners with a github column")
+    certs = check.add_argument_group("certificates and access paths")
+    certs.add_argument("--allow-ca", type=Path, action="append", help="approved CA public keys (user and host CAs); repeatable")
+    certs.add_argument("--max-cert-days", type=int, default=90, help="warn on certificates valid for longer than this (default 90)")
+    certs.add_argument("--require-jump", action="store_true", help="fail hosts that Keywarden reached directly instead of through a jump host")
+    fixes = check.add_argument_group("fix plan and alerts")
+    fixes.add_argument("--fix-plan", type=Path, help="write an Ansible playbook that removes flagged keys; Keywarden never runs it")
+    fixes.add_argument("--fix-for", help="what the fix plan removes: leaver, outside, stale, unowned, expired (default leaver,outside)")
+    fixes.add_argument("--notify", help="webhook URL for a summary (Slack, Teams workflow, Discord, or any JSON endpoint); or set KEYWARDEN_WEBHOOK")
+    fixes.add_argument("--notify-on", choices=["drift", "fail", "always"], default="drift", help="when to post (default drift: something new since --prior)")
+    fixes.add_argument("--notify-format", choices=["auto", "slack", "teams", "discord", "json"], default="auto", help="message shape (default: from the URL)")
 
     where = sub.add_parser("where", help="find every host and account that accepts a key")
     where.add_argument("fingerprint", nargs="*", default=[], help="SHA256:... fingerprint; repeatable")
     where.add_argument("--key", type=Path, action="append", help="public key file to look for; repeatable")
     where.add_argument("--json", action="store_true", help="print JSON")
     _add_source(where, "Ansible INI inventory; one SSH per host")
+
+    review = sub.add_parser("review", help="seal, sign, and verify access review records")
+    review_sub = review.add_subparsers(dest="review_command", required=True)
+    record = review_sub.add_parser("record", help="turn a decisions file and a report into a sealed review record")
+    record.add_argument("report", type=Path, help="keywarden JSON report the review covers")
+    record.add_argument("decisions", type=Path, help="CSV or JSON: host, account, fingerprint, decision (approve/revoke), note")
+    record.add_argument("--reviewer", required=True, help="reviewer's name, as it should appear on the record")
+    record.add_argument("--role", default="", help="reviewer's role")
+    record.add_argument("--output", type=Path, required=True, help="write the record (JSON) here; an .html copy is written beside it")
+    signer = review_sub.add_parser("sign", help="sign a review record with your SSH key (ssh-keygen -Y sign)")
+    signer.add_argument("record", type=Path)
+    signer.add_argument("--key", type=Path, required=True, help="your SSH private key; ssh-keygen reads it, Keywarden does not")
+    verifier = review_sub.add_parser("verify", help="check a record's seal, and its signature with --signers")
+    verifier.add_argument("record", type=Path)
+    verifier.add_argument("--signers", type=Path, help="allowed_signers file (see ssh-keygen ALLOWED SIGNERS)")
+    verifier.add_argument("--identity", help="signer identity in allowed_signers (default: the reviewer's name)")
+
+    plan = sub.add_parser("plan", help="write a fix-plan playbook from a saved report and, optionally, a review record")
+    plan.add_argument("report", type=Path, help="keywarden JSON report")
+    plan.add_argument("--review", type=Path, help="review record; its revoke decisions are removed")
+    plan.add_argument("--fix-for", help="also remove: leaver, outside, stale, unowned, expired (default: only revoked keys when --review is given)")
+    plan.add_argument("--output", type=Path, required=True, help="playbook to write")
 
     ui = sub.add_parser("ui", help="open the checks in a browser tab served from this machine only")
     ui.add_argument("--port", type=int, default=None, help="port on 127.0.0.1 (default 8765, or any free port if it is taken)")
@@ -678,6 +863,10 @@ def main(argv: list[str] | None = None) -> int:
             return serve(args.port, open_browser=not args.no_browser)
         if args.command == "where":
             return _where(args)
+        if args.command == "review":
+            return _review(args)
+        if args.command == "plan":
+            return _plan(args)
         if args.inventory:
             return _check_inventory(args)
         return _check_one(args)

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.0 — 2026-11-18
+
+Access review, end to end: who owns each key, who has left, a signed decision for every key, and the playbook that removes what was revoked.
+
+- **Key owners**: `--owners` maps keys to people from CSV, JSON, LDIF (`sshPublicKey`), a directory of `<person>.pub` files, or GitHub (`https://github.com/<user>.keys`). The access review table gains `owner`, the report an `owners` summary, and the terminal a **who has access** list. New check `key-owner` warns on keys nobody owns.
+- **Leaver sweep**: `--leavers` (names, emails, or GitHub users, one per line) fails `leaver-key` for any of their keys still authorized, and lists leavers with no keys on file.
+- **Review sign-off**: the GUI's **Access Review** tab takes an Approve or Revoke decision and a note per key and exports a sealed review record (JSON and HTML). `keywarden review sign` adds an SSH signature (`ssh-keygen -Y sign`); `keywarden review verify` checks the seal and the signature. `keywarden review record` seals decisions from a CSV.
+- **Fix plan**: `--fix-plan`, `keywarden plan`, and **Fix Plan** in the GUI write an Ansible playbook that removes flagged or revoked keys by fingerprint. Dry run by default; `-e keywarden_apply=true` applies it, after a backup. Keywarden never runs it.
+- **Alerts**: `--notify` posts a summary to Slack, Teams workflows, Discord, or any JSON webhook when something changed (or on failure, or always). `--prior` now works for inventory runs, host by host.
+- **Certificates**: `--allow-ca` approves user and host CAs; `trusted-user-ca` reads the CA keys sshd trusts and compares them; certificates signed by other CAs fail; long-lived (`--max-cert-days`, default 90), never-expiring, or principal-less certificates warn. New check `host-certificate` for the host's own certificate. Collector protocol 4 carries the CA and host certificate files (public keys only); protocol 2 and 3 output still reads.
+- **Jump hosts**: `ProxyJump` and `ProxyCommand "ssh -W"` in `ansible_ssh_common_args` are honoured, as is `ProxyJump` in `~/.ssh/config`; `--jump` for `--host`. Each host reports its `accessPath`. `--require-jump` fails hosts reached directly (`jump-host`).
+- **macOS and FreeBSD**: the collector reads macOS Directory Services users and the unified log, and BSD `bzip2`/`xz`-rotated auth logs. CI runs it on a real Mac and a FreeBSD VM, and runs the tests on Windows and macOS.
+- **GitHub Action** (`uses: generalwax2018/keywarden@v0.5.0`) and a **container image** (`Dockerfile`, non-root, `ssh` included).
+- **Release provenance**: PyPI attestations, a GitHub build-provenance attestation, and `SHA256SUMS` on each GitHub release. OpenSSF Scorecard runs weekly.
+- Compliance mapping: `leaver-key` (CIS 6.2, NIST AC-2 and PS-4, PCI DSS 8.2.5, CIP-004-7 R5.1), `key-owner` (CIS 5.1, NIST AC-2 and IA-4, PCI DSS 8.2.1, CIP-004-7 R4.1), `host-certificate` (NIST IA-3, SC-17), `jump-host` (NIST AC-17, SC-7, CIP-005-7 R2.1).
+- Fixed: INI inventory values in quotes (`ansible_ssh_common_args="-o ..."`) are kept whole instead of split at spaces.
+
 ## 0.4.0 — 2026-11-17
 
 - Parallel inventory runs: `--jobs` (default 8, up to 32) for `check` and `where`, and a **Hosts at once** setting in the GUI. Results stay in inventory order. Up to 2,000 hosts per run.

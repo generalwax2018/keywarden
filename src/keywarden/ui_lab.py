@@ -171,3 +171,13 @@ def lab_hosts(now: int) -> list[tuple[HostObservation, str, str, dict]]:
         observation = parse_protocol(_host(name, now, sshd, accounts(name), logins), address=address)
         result.append((observation, address, role, prior))
     return result
+
+# Example owners and leavers for the lab, so the access review shows names. Fictional people.
+LAB_OWNERS = """owner,email,fingerprint
+Dana Ortiz,dana@example.com,SHA256:i9/X7kZqpISKANQXHxfPGg8U32ooosWg6S4XoO75GPM
+Sam Lee,sam@example.com,SHA256:BNoQD4Wf77hZm/d8wgupys3Q8D25eT7kcIUSG/QFkFo
+CI pipeline,ci@example.com,SHA256:j3R9m4RJe0je3bKTU0QW71lNhhBZJucDuno8zbzijOo
+Jordan Pike,jordan@example.com,SHA256:Bp52GaHcgigUoEWMzWgfUk/2Rnaw5UXCf06Srz7c35M
+Alice Chen,alice@example.com,SHA256:yte5ad25CKp2zMQt3Rkm+MD7caZJqsGBUjFmp+ZWAYk
+"""
+LAB_LEAVERS = "jordan@example.com\nalice@example.com\n"

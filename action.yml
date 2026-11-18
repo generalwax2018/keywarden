@@ -1,0 +1,93 @@
+name: Keywarden SSH access check
+description: Check SSH posture and key access across an Ansible inventory, and upload the findings to code scanning.
+author: Michael Waxman
+branding:
+  icon: key
+  color: blue
+
+inputs:
+  inventory:
+    description: Ansible inventory to check (INI, JSON, or YAML when Ansible is installed)
+    required: true
+  allow:
+    description: File with the public keys you push
+    required: false
+    default: ""
+  owners:
+    description: Key owners file (CSV, JSON, LDIF, or a directory of <person>.pub files)
+    required: false
+    default: ""
+  leavers:
+    description: People who have left, one per line
+    required: false
+    default: ""
+  args:
+    description: Extra arguments for keywarden check (for example --require-jump --stale-days 60)
+    required: false
+    default: ""
+  sarif:
+    description: Where to write SARIF
+    required: false
+    default: keywarden.sarif
+  upload-sarif:
+    description: Upload the SARIF to GitHub code scanning (needs security-events write)
+    required: false
+    default: "true"
+  fail-on-findings:
+    description: Fail the step when a host fails a check
+    required: false
+    default: "false"
+
+outputs:
+  sarif:
+    description: Path to the SARIF file
+    value: ${{ inputs.sarif }}
+  exit-code:
+    description: 0 clear, 1 a host failed a check, 2 the run could not complete
+    value: ${{ steps.check.outputs.exit-code }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v7
+      with:
+        python-version: "3.13"
+    - name: install Keywarden from this action's own source
+      shell: bash
+      run: python -m pip install --quiet "${{ github.action_path }}"
+    - name: check
+      id: check
+      shell: bash
+      env:
+        KW_INVENTORY: ${{ inputs.inventory }}
+        KW_ALLOW: ${{ inputs.allow }}
+        KW_OWNERS: ${{ inputs.owners }}
+        KW_LEAVERS: ${{ inputs.leavers }}
+        KW_SARIF: ${{ inputs.sarif }}
+        KW_ARGS: ${{ inputs.args }}
+      run: |
+        set -u
+        command=(keywarden check --inventory "$KW_INVENTORY" --sarif "$KW_SARIF" --color never)
+        [ -n "$KW_ALLOW" ] && command+=(--allow "$KW_ALLOW")
+        [ -n "$KW_OWNERS" ] && command+=(--owners "$KW_OWNERS")
+        [ -n "$KW_LEAVERS" ] && command+=(--leavers "$KW_LEAVERS")
+        # Extra arguments are split on spaces, never evaluated by the shell.
+        read -r -a extra <<< "$KW_ARGS"
+        set +e
+        "${command[@]}" ${extra[@]+"${extra[@]}"}
+        code=$?
+        set -e
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        if [ "$code" -ge 2 ]; then exit "$code"; fi
+    - name: upload to code scanning
+      if: ${{ inputs.upload-sarif == 'true' && always() }}
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: ${{ inputs.sarif }}
+        category: keywarden
+    - name: fail on findings
+      if: ${{ inputs.fail-on-findings == 'true' && steps.check.outputs.exit-code == '1' }}
+      shell: bash
+      run: |
+        echo "Keywarden found a failing host."
+        exit 1

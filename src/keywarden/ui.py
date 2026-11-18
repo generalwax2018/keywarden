@@ -42,11 +42,11 @@ from keywarden.collect import (
     parse_protocol,
 )
 from keywarden.parse import KeyRef, PrivateKeyError, kind_of, parse_public_keys
-from keywarden.ui_lab import LAB_PUSH, lab_hosts
+from keywarden.ui_lab import LAB_LEAVERS, LAB_OWNERS, LAB_PUSH, lab_hosts
 from keywarden.ui_page import render_page
 from keywarden.waivers import apply_waivers, load_waivers
 
-MAX_BODY = 2_000_000
+MAX_BODY = 20_000_000  # a review posts the whole report back
 TARGETS = {"lab", "local", "host", "inventory", "paste"}
 
 
@@ -81,10 +81,28 @@ def _policy(body: dict) -> Policy:
     stale = body.get("staleDays", 90)
     if not isinstance(stale, int) or stale < 1 or stale > 3650:
         raise BadRequest("Stale after must be between 1 and 3650 days.")
+    from keywarden.owners import book_from_texts
+    from keywarden.parse import contains_private_key
+
+    owners_text = str(body.get("ownersText") or "")
+    leavers_text = str(body.get("leaversText") or "")
+    if leavers_text.strip() and not owners_text.strip():
+        raise BadRequest("Add a key owners file too, so Keywarden knows whose keys to sweep.")
+    book = book_from_texts(owners_text, leavers_text)
+    cas = None
+    ca_text = str(body.get("allowCaText") or "")
+    if ca_text.strip():
+        if contains_private_key(ca_text):
+            raise PrivateKeyError("private key material was present and was not recorded")
+        keys, _issues = parse_public_keys(ca_text)
+        cas = frozenset(key.fingerprint for key in keys)
     return Policy(
         flag_outside_push=bool(body.get("flagOutside", True)),
         flag_weak=bool(body.get("flagWeak", True)),
         stale_days=stale,
+        owners=book,
+        allowed_cas=cas,
+        require_jump=bool(body.get("requireJump", False)),
     )
 
 
@@ -214,6 +232,10 @@ def run_check(body: dict) -> dict:
         hosts.append(report)
     document = _envelope(push)
     document["hosts"] = hosts
+    if policy.owners is not None:
+        from keywarden.owners import owner_summary
+
+        document["owners"] = owner_summary(rows)
     document["posture"] = "fail" if any(host["posture"] == "fail" for host in hosts) else "pass"
     notes = [
         f"Waiver {waiver.label} ({waiver.code}) matched nothing; remove it if the risk is gone."
@@ -229,6 +251,25 @@ def run_check(body: dict) -> dict:
         "notes": notes,
         "lab": body.get("target") == "lab",
     }
+
+
+def run_review(body: dict) -> dict:
+    from keywarden.review import build_record, render_html
+
+    record = build_record(body.get("report"), body.get("reviewer") or {}, body.get("decisions") or [])
+    return {"record": record, "html": render_html(record)}
+
+
+def run_fixplan(body: dict) -> dict:
+    from keywarden.collect import now_iso
+    from keywarden.fixplan import removals, render_playbook
+
+    report = body.get("report")
+    if not isinstance(report, dict):
+        raise BadRequest("Run a check first.")
+    decisions = body.get("decisions") or []
+    items = removals(report, {"leaver"}, {"decisions": decisions if isinstance(decisions, list) else []})
+    return {"playbook": render_playbook(items, generated=now_iso(), version=__version__), "count": sum(len(item["keys"]) for item in items)}
 
 
 def run_where(body: dict) -> dict:
@@ -332,7 +373,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             length = -1
         if length < 0 or length > MAX_BODY:
-            return self._send_json(413, {"error": "The request is larger than 2 MB."})
+            return self._send_json(413, {"error": "The request is larger than 20 MB."})
         raw = self.rfile.read(length)
         try:
             body = json.loads(raw.decode("utf-8"))
@@ -345,12 +386,16 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.path == "/api/check":
                 return self._send_json(200, run_check(body))
+            if self.path == "/api/review":
+                return self._send_json(200, run_review(body))
+            if self.path == "/api/fixplan":
+                return self._send_json(200, run_fixplan(body))
             if self.path == "/api/where":
                 return self._send_json(200, run_where(body))
             if self.path == "/api/collector":
                 return self._send_json(200, {"script": REMOTE_SCRIPT})
             if self.path == "/api/lab-keys":
-                return self._send_json(200, {"keys": LAB_PUSH})
+                return self._send_json(200, {"keys": LAB_PUSH, "owners": LAB_OWNERS, "leavers": LAB_LEAVERS})
             return self._send_json(404, {"error": "not found"})
         except PrivateKeyError:
             return self._send_json(400, {"error": "A private key was in the input. Keywarden takes public keys only and kept nothing."})

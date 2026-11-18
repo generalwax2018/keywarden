@@ -34,6 +34,7 @@ _ACCEPTED = re.compile(
     r"(?P<fp>SHA256:[A-Za-z0-9+/]+)(?:.*? CA \S+ (?P<ca>SHA256:[A-Za-z0-9+/]+))?"
 )
 _SYSLOG_TIME = re.compile(r"^(?P<mon>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})\s+(?P<time>\d{2}:\d{2}:\d{2})(?:\s|$)")
+_SPACED_TIME = re.compile(r"^(?P<stamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:\.\d+)?(?P<zone>[+-]\d{4})?(?:\s|$)")
 _MONTHS = {name: index for index, name in enumerate(
     ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], start=1)}
 _QUIET_LOG_LEVELS = {"quiet", "fatal", "error"}
@@ -130,6 +131,15 @@ def parse_log_time(line: str, now: int | None, offset: str | None) -> int | None
             if moment.tzinfo is None:
                 moment = moment.replace(tzinfo=_zone(offset))
             return int(moment.timestamp())
+    spaced = _SPACED_TIME.match(line)
+    if spaced:
+        # macOS `log show --style syslog`: 2026-11-17 10:04:12.123456-0800
+        zone = _zone(spaced.group("zone")) if spaced.group("zone") else _zone(offset)
+        try:
+            moment = datetime.strptime(spaced.group("stamp"), "%Y-%m-%d %H:%M:%S").replace(tzinfo=zone)
+        except ValueError:
+            return None
+        return int(moment.timestamp())
     match = _SYSLOG_TIME.match(line)
     if not match or match.group("mon") not in _MONTHS:
         return None
@@ -195,7 +205,7 @@ def _login_for(host: HostObservation, user: str, key: KeyRef) -> Login | None:
 
 
 def logs_usable(host: HostObservation) -> bool:
-    return host.log_source in {"journal", "file"} and host.now is not None
+    return host.log_source in {"journal", "file", "unified"} and host.now is not None
 
 
 def usage_status(host: HostObservation, user: str, key: KeyRef, policy: Policy) -> tuple[str, Login | None]:
@@ -244,6 +254,11 @@ def key_rows(host: HostObservation, push: list[KeyRef], policy: Policy) -> list[
                 "uses": login.count if login else 0,
                 "lastFrom": login.source if login else None,
             }
+            book = policy.owners
+            if book is not None:
+                owner = book.owner_of(key.fingerprint)
+                row["owner"] = owner.name or owner.email if owner else None
+                row["ownerLeft"] = bool(owner and book.has_left(owner))
             rows.append(row)
     return rows
 
@@ -406,7 +421,10 @@ def _usage_findings(host: HostObservation, readable: list[Account], policy: Poli
         return [Finding("auth-log", "warn", "Key usage could not be checked", detail + " stale-key was skipped, not passed.")]
     findings: list[Finding] = []
     covered_days = int(((host.now or 0) - (host.log_since or host.now or 0)) / DAY)
-    source = "the systemd journal (sshd units only)" if host.log_source == "journal" else "syslog files, which any local user can write to"
+    source = {
+        "journal": "the systemd journal (sshd units only)",
+        "unified": "the macOS unified log (sshd processes only)",
+    }.get(host.log_source, "syslog files, which any local user can write to")
     if covered_days < LOG_RETENTION_DAYS:
         findings.append(
             Finding(
@@ -457,3 +475,64 @@ def _usage_findings(host: HostObservation, readable: list[Account], policy: Poli
     elif readable:
         findings.append(Finding("stale-key", "pass", f"Every key was used in the last {policy.stale_days} days", "Each authorized key has a login in the sshd log."))
     return findings
+
+
+def owner_findings(host: HostObservation, policy: Policy) -> list[Finding]:
+    """Keys nobody owns, and keys of people who have left. Only with --owners."""
+    book = policy.owners
+    if book is None or not getattr(book, "active", False):
+        return []
+    findings: list[Finding] = []
+    readable = [account for account in host.accounts if account.read_state == "ok" and account.keys]
+    leavers: list[str] = []
+    unowned: list[str] = []
+    for account in readable:
+        reach = reach_of(account)
+        for key in account.keys:
+            owner = book.owner_of(key.fingerprint)
+            if owner is None:
+                unowned.append(_line(account, key))
+            elif book.has_left(owner):
+                who = owner.name or owner.email
+                leavers.append(f"{who} · {account.user} · {key.fingerprint} (reach {reach.level})")
+    if leavers:
+        findings.append(
+            Finding(
+                "leaver-key",
+                "fail",
+                "A departed person's key still logs in" if len(leavers) == 1 else f"{len(leavers)} keys of departed people still log in",
+                "; ".join(leavers) + ". Remove these keys now; access for people who have left must be revoked.",
+            )
+        )
+    elif book.leavers or any(owner.left for owner in book.owners):
+        findings.append(Finding("leaver-key", "pass", "No departed person's key is authorized", "None of the keys belongs to someone on the leavers list."))
+    if unowned:
+        findings.append(
+            Finding(
+                "key-owner",
+                "warn",
+                "A key has no known owner" if len(unowned) == 1 else f"{len(unowned)} keys have no known owner",
+                "; ".join(unowned) + ". Add each to the owners file, or remove it.",
+            )
+        )
+    elif readable:
+        findings.append(Finding("key-owner", "pass", "Every key has a named owner", "Each authorized key matched someone in the owners file."))
+    return findings
+
+
+def path_findings(host: HostObservation, policy: Policy) -> list[Finding]:
+    """With --require-jump: hosts must be reached through an intermediate system."""
+    path = host.access_path
+    if not policy.require_jump or not path:
+        return []
+    if path.get("via"):
+        return [Finding("jump-host", "pass", "Reached through a jump host", f"Keywarden reached this host through {path['via']} ({path.get('source', 'ssh')}).")]
+    return [
+        Finding(
+            "jump-host",
+            "fail",
+            "Reached directly, not through a jump host",
+            "Keywarden opened SSH straight to this host. If interactive access should go through a bastion, "
+            "block direct SSH at the network and set ProxyJump in the inventory or ssh config.",
+        )
+    ]
